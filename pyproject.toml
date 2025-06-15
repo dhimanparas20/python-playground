@@ -9,4 +9,5 @@ dependencies = [
     "passlib>=1.7.4",
     "pydantic>=2.11.7",
     "pymongo>=4.13.1",
+    "redis>=6.2.0",
 ]
