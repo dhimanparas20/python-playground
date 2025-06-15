@@ -7,5 +7,6 @@ requires-python = ">=3.11"
 dependencies = [
     "bson>=0.5.10",
     "passlib>=1.7.4",
+    "pydantic>=2.11.7",
     "pymongo>=4.13.1",
 ]
