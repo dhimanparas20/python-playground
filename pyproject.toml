@@ -4,4 +4,8 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "bson>=0.5.10",
+    "passlib>=1.7.4",
+    "pymongo>=4.13.1",
+]
