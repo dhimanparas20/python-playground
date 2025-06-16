@@ -1,7 +1,6 @@
 from pydantic import BaseModel, Field, ValidationError, SecretStr
 from typing import List, Optional
-from bson import ObjectId
-from pymongo_sync import MongoDB  # Your module
+from modules.pymongo_sync import MongoDB  # Your module
 
 class AuthorModel(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)

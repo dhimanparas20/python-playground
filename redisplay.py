@@ -1,4 +1,4 @@
-from redis_util import RedisHashMap
+from modules.redis_util import RedisHashMap
 
 # 1. BOOKS CRUD
 books = RedisHashMap("library:books")
