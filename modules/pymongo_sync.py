@@ -136,9 +136,10 @@ class MongoDB:
         result = self.collection.insert_many(data, *args, **kwargs)
         return [str(_id) for _id in result.inserted_ids]
 
-    def fetch(self, filter: Optional[Dict[str, Any]] = None, show_id: bool = False, *args, **kwargs) -> List[Dict[str, Any]]:
+    def filter(self, filter: Optional[Dict[str, Any]] = None, show_id: bool = False, *args, **kwargs) -> List[
+        Dict[str, Any]]:
         """
-        Fetch documents from the collection.
+        Filter documents from the collection.
 
         Args:
             filter (Optional[Dict[str, Any]]): Query filter.
@@ -151,11 +152,34 @@ class MongoDB:
         cursor = self.collection.find(filter or {}, projection, *args, **kwargs)
         result = []
         if show_id:
-            # Convert _id to string if present
-            result = list(map(lambda item: {**item, "_id": str(item["_id"])} if "_id" in item else item, cursor))
+            result = [{**item, "_id": str(item["_id"])} if "_id" in item else item for item in cursor]
         else:
             result = list(cursor)
         return result
+
+    def get(self, filter: Optional[Dict[str, Any]] = None, show_id: bool = False, *args, **kwargs) -> Optional[
+        Dict[str, Any]]:
+        """
+        Get a single document matching the filter.
+
+        Args:
+            filter (Optional[Dict[str, Any]]): Query filter.
+            show_id (bool): Whether to include '_id' in result.
+
+        Returns:
+            Optional[Dict[str, Any]]: The first matching document, or None if not found.
+
+        Raises:
+            Exception: If an error occurs during retrieval.
+        """
+        projection = None if show_id else {"_id": 0}
+        try:
+            doc = self.collection.find_one(filter or {}, projection, *args, **kwargs)
+            if doc and show_id and "_id" in doc:
+                doc["_id"] = str(doc["_id"])
+            return doc
+        except Exception as e:
+            raise Exception(f"Error in get: {e}")
 
     def count(self, filter: Optional[Dict[str, Any]] = None, *args, **kwargs) -> int:
         """
@@ -261,7 +285,7 @@ class MongoDB:
             _id = ObjectId(_id)
         return self.collection.find_one({"_id": _id})
 
-    def update_or_create(self, filter: Dict[str, Any], data: Dict[str, Any]) -> str:
+    def update_or_create(self, filter: Dict[str, Any], data: Dict[str, Any]) -> (Dict[str, Any], bool):
         """
         Update a document matching the filter, or create it if it doesn't exist.
 
@@ -270,18 +294,26 @@ class MongoDB:
             data (Dict[str, Any]): Data to update or insert.
 
         Returns:
-            str: The _id of the updated or created document.
+            Tuple[Dict[str, Any], bool]: (The document, created True if inserted, False if updated)
         """
-        # Try to update
-        result = self.collection.update_one(filter, {"$set": data}, upsert=True)
-        # If upserted_id is not None, a new document was created
-        if result.upserted_id is not None:
-            return str(result.upserted_id)
-        # Otherwise, fetch the existing document's _id
-        doc = self.collection.find_one(filter, {"_id": 1})
-        return str(doc["_id"]) if doc else None
+        try:
+            result = self.collection.update_one(filter, {"$set": data}, upsert=True)
+            if result.upserted_id is not None:
+                # Created new
+                doc = self.collection.find_one({"_id": result.upserted_id})
+                if doc:
+                    doc["_id"] = str(doc["_id"])
+                return doc, True
+            else:
+                # Updated existing
+                doc = self.collection.find_one(filter)
+                if doc:
+                    doc["_id"] = str(doc["_id"])
+                return doc, False
+        except Exception as e:
+            raise Exception(f"Error in update_or_create: {e}")
 
-    def fetch_or_create(self, filter: Dict[str, Any], data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def fetch_or_create(self, filter: Dict[str, Any], data: Optional[Dict[str, Any]] = None) -> (Dict[str, Any], bool):
         """
         Fetch a document matching the filter, or create it if it doesn't exist.
 
@@ -290,19 +322,22 @@ class MongoDB:
             data (Optional[Dict[str, Any]]): Data to insert if not found.
 
         Returns:
-            Dict[str, Any]: The fetched or created document.
+            Tuple[Dict[str, Any], bool]: (The document, created True if inserted, False if fetched)
         """
-        doc = self.collection.find_one(filter)
-        if doc:
-            doc["_id"] = str(doc["_id"])
-            return doc
-        # Merge filter and data for creation
-        new_doc = {**filter}
-        if data:
-            new_doc.update(data)
-        inserted_id = self.collection.insert_one(new_doc).inserted_id
-        new_doc["_id"] = str(inserted_id)
-        return new_doc
+        try:
+            doc = self.collection.find_one(filter)
+            if doc:
+                doc["_id"] = str(doc["_id"])
+                return doc, False
+            # Merge filter and data for creation
+            new_doc = {**filter}
+            if data:
+                new_doc.update(data)
+            inserted_id = self.collection.insert_one(new_doc).inserted_id
+            new_doc["_id"] = str(inserted_id)
+            return new_doc, True
+        except Exception as e:
+            raise Exception(f"Error in fetch_or_create: {e}")
 
 
 # Usage Example:
