@@ -13,7 +13,7 @@ import random
 import string
 from passlib.hash import pbkdf2_sha256
 
-DEFAULT_STRING = "mongodb://mongo:27017/"
+DEFAULT_STRING = "mongodb://localhost:27017/"
 
 class MongoDB:
     """
@@ -122,6 +122,26 @@ class MongoDB:
         """
         result = self.collection.insert_one(data, *args, **kwargs)
         return str(result.inserted_id)
+
+    def insert_unique(self, filter: Dict[str, Any], data: Dict[str, Any]) -> bool:
+        """
+        Insert a document only if no document matches the unique filter.
+
+        Args:
+            filter (Dict[str, Any]): Query filter to check uniqueness.
+            data (Dict[str, Any]): Document to insert.
+
+        Returns:
+            bool: True if inserted, False if already exists.
+
+        Raises:
+            Exception: If document already exists.
+        """
+        if self.count(filter) > 0:
+            # Already exists
+            return False
+        self.insert(data)
+        return True
 
     def insert_many(self, data: List[Dict[str, Any]], *args, **kwargs) -> List[str]:
         """
@@ -313,7 +333,7 @@ class MongoDB:
         except Exception as e:
             raise Exception(f"Error in update_or_create: {e}")
 
-    def fetch_or_create(self, filter: Dict[str, Any], data: Optional[Dict[str, Any]] = None) -> (Dict[str, Any], bool):
+    def get_or_create(self, filter: Dict[str, Any], data: Optional[Dict[str, Any]] = None) -> (Dict[str, Any], bool):
         """
         Fetch a document matching the filter, or create it if it doesn't exist.
 
