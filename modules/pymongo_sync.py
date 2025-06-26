@@ -3,7 +3,7 @@ MongoDB Utility Module
 
 Production-ready MongoDB utility class using PyMongo.
 Requirements: pymongo==4.6.0, passlib
-pip3 install pymongo, bson, passlib
+pip3 install pymongo, passlib
 """
 
 from typing import Any, Dict, List, Optional, Union
@@ -260,6 +260,50 @@ class MongoDB:
         if isinstance(_id, str):
             _id = ObjectId(_id)
         return self.collection.find_one({"_id": _id})
+
+    def update_or_create(self, filter: Dict[str, Any], data: Dict[str, Any]) -> str:
+        """
+        Update a document matching the filter, or create it if it doesn't exist.
+
+        Args:
+            filter (Dict[str, Any]): Query filter.
+            data (Dict[str, Any]): Data to update or insert.
+
+        Returns:
+            str: The _id of the updated or created document.
+        """
+        # Try to update
+        result = self.collection.update_one(filter, {"$set": data}, upsert=True)
+        # If upserted_id is not None, a new document was created
+        if result.upserted_id is not None:
+            return str(result.upserted_id)
+        # Otherwise, fetch the existing document's _id
+        doc = self.collection.find_one(filter, {"_id": 1})
+        return str(doc["_id"]) if doc else None
+
+    def fetch_or_create(self, filter: Dict[str, Any], data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Fetch a document matching the filter, or create it if it doesn't exist.
+
+        Args:
+            filter (Dict[str, Any]): Query filter.
+            data (Optional[Dict[str, Any]]): Data to insert if not found.
+
+        Returns:
+            Dict[str, Any]: The fetched or created document.
+        """
+        doc = self.collection.find_one(filter)
+        if doc:
+            doc["_id"] = str(doc["_id"])
+            return doc
+        # Merge filter and data for creation
+        new_doc = {**filter}
+        if data:
+            new_doc.update(data)
+        inserted_id = self.collection.insert_one(new_doc).inserted_id
+        new_doc["_id"] = str(inserted_id)
+        return new_doc
+
 
 # Usage Example:
 # mydb = MongoDB("AutomationBOT", "bot
