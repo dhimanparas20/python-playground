@@ -5,11 +5,12 @@ from shutil import rmtree
 from time import sleep,perf_counter
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Process,Pool
+from tqdm import tqdm
 import asyncio
 system("clear")
 
 DOWNLOAD_FOLDER = "images"
-IMAGE_COUNT = 100
+IMAGE_COUNT = 10
 URl = "https://picsum.photos/2000/2000"
 processes = []
 download_times = {
@@ -32,13 +33,30 @@ def pre_setup():
     mkdir(DOWNLOAD_FOLDER)
 
 # Main function to download the image
-def  download_image(image_name,url=URl):
-    print(f"Downloading image: {image_name}")
+def download_image(image_name, url=URl):
+    # print(f"Downloading image: {image_name}")
     try:
-        with open(f"{DOWNLOAD_FOLDER}/{image_name}.jpg","wb") as file:
-            response = requests.get(url)
-            file.write(response.content)
-        print(f"Image {image_name} downloaded")
+        response = requests.get(url, stream=True)
+        response.raise_for_status()  # Raise an exception for bad status codes
+
+        # Get the total file size from headers
+        total_size = int(response.headers.get('content-length', 0))
+
+        with open(f"{DOWNLOAD_FOLDER}/{image_name}.jpg", "wb") as file:
+            with tqdm(
+                    desc=f"{image_name}",
+                    total=total_size,
+                    unit='B',
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    leave=True  # Remove progress bar after completion
+            ) as pbar:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:  # Filter out keep-alive chunks
+                        size = file.write(chunk)
+                        pbar.update(size)
+
+        # print(f"Image {image_name} downloaded")
     except Exception as e:
         print(f"Error downloading image {image_name}: {e}")
 
