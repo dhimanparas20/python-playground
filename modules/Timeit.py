@@ -2,6 +2,7 @@ import functools
 import time
 from typing import Callable, Any
 
+
 # Option 1: Using ANSI escape codes (no external dependencies)
 class Colors:
     HEADER = '\033[95m'
@@ -14,19 +15,21 @@ class Colors:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
 
+
 def timeit(func: Callable) -> Callable:
     """
     Decorator to measure execution time of a function.
     Uses time.perf_counter() for high precision timing.
     """
+
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         start_time = time.perf_counter()
         result = func(*args, **kwargs)
         end_time = time.perf_counter()
-        
+
         execution_time = end_time - start_time
-        
+
         # Color-code based on execution time
         if execution_time < 0.1:
             color = Colors.OKGREEN
@@ -40,12 +43,12 @@ def timeit(func: Callable) -> Callable:
         else:
             color = Colors.FAIL
             emoji = "🐌"
-        
+
         print(f"{color}{emoji} Function '{Colors.BOLD}{func.__name__}{Colors.ENDC}{color}' "
               f"took {Colors.BOLD}{execution_time:.6f}{Colors.ENDC}{color} seconds{Colors.ENDC}")
-        
+
         return result
-    
+
     return wrapper
 
 
@@ -53,20 +56,21 @@ def timeit(func: Callable) -> Callable:
 def timeit_stats(threshold: float = 1.0, unit: str = "auto"):
     """
     Enhanced decorator with configurable threshold and unit.
-    
+
     Args:
         threshold: Time threshold for warnings (in seconds)
         unit: Time unit ('auto', 's', 'ms', 'μs')
     """
+
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             start_time = time.perf_counter()
             result = func(*args, **kwargs)
             end_time = time.perf_counter()
-            
+
             execution_time = end_time - start_time
-            
+
             # Auto-select appropriate unit
             if unit == "auto":
                 if execution_time < 0.001:
@@ -81,7 +85,7 @@ def timeit_stats(threshold: float = 1.0, unit: str = "auto"):
             else:
                 time_value = execution_time
                 time_unit = unit
-            
+
             # Color based on threshold
             if execution_time < threshold * 0.5:
                 color = Colors.OKGREEN
@@ -89,11 +93,11 @@ def timeit_stats(threshold: float = 1.0, unit: str = "auto"):
                 color = Colors.OKCYAN
             else:
                 color = Colors.FAIL
-            
+
             print(f"{color}⏱  {func.__name__}() → {time_value:.3f} {time_unit}{Colors.ENDC}")
-            
+
             return result
-        
+
         return wrapper
-    
+
     return decorator
