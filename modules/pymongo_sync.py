@@ -19,7 +19,6 @@ class MongoDB:
     """
     MongoDB utility class for database and collection operations.
     """
-
     def __init__(self, db_name: str, collection_name: str, connection_str: str = DEFAULT_STRING) -> None:
         """
         Initialize MongoDB client and select database and collection.
@@ -77,7 +76,7 @@ class MongoDB:
         characters = string.ascii_letters + string.digits
         return ''.join(random.choices(characters, k=length))
 
-    def add_db(self, db_name: str, collection_name: str) -> None:
+    def switch_db_collection(self, db_name: str, collection_name: str) -> None:
         """
         Switch to a different database and collection.
 
@@ -109,6 +108,16 @@ class MongoDB:
         """
         db = self.client[db_name] if db_name else self.db
         return db.list_collection_names()
+
+    def switch_collection(self, collection_name: str):
+        """
+        Switch to a different collection.
+
+        Args:
+            collection_name (str): Collection name.
+        """
+        self.collection = self.db[collection_name]
+        return self.collection
 
     def insert(self, data: Dict[str, Any], *args, **kwargs) -> str:
         """
@@ -284,12 +293,6 @@ class MongoDB:
             keys.remove('_id')
         return keys
 
-    def close(self) -> None:
-        """
-        Close the MongoDB client connection.
-        """
-        self.client.close()
-
     # Extra utility: get a document by ID
     def get_by_id(self, _id: Union[str, ObjectId]) -> Optional[Dict[str, Any]]:
         """
@@ -358,6 +361,12 @@ class MongoDB:
             return new_doc, True
         except Exception as e:
             raise Exception(f"Error in fetch_or_create: {e}")
+
+    def close(self) -> None:
+        """
+        Close the MongoDB client connection.
+        """
+        self.client.close()
 
 
 # Usage Example:
