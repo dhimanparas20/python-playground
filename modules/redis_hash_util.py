@@ -107,26 +107,29 @@ class RedisHashUtil:
 
     def create(
         self,
-        id: str,
         data: Dict[str, Any],
+        id: Optional[str] = None,
         overwrite: bool = False,
         ttl: Optional[int] = None,
-    ) -> bool:
+    ) -> str:
         """
         Create a new hash entry or update if overwrite is True.
+        If id is not provided, a UUID4 is auto-generated.
 
         Args:
-            id: Unique identifier for the hash entry.
             data: Dictionary of field-value pairs to store.
+            id: Unique identifier for the hash entry. Auto-generated if None.
             overwrite: If True, delete existing data before writing.
             ttl: TTL in seconds for this entry. Overrides default_ttl if provided.
 
         Returns:
-            True if operation succeeded.
+            The entry id (provided or auto-generated).
 
         Raises:
             ValueError: If entry exists and overwrite is False.
         """
+        if id is None:
+            id = self.generate_uuid4()
         key = self._key(id)
         if not overwrite and self._sync_client.exists(key):
             raise ValueError(f"Entry '{key}' already exists. Use overwrite=True to update.")
@@ -134,7 +137,7 @@ class RedisHashUtil:
             self._sync_client.delete(key)
         self._sync_client.hset(key, mapping=data)
         self._apply_ttl(key, ttl)
-        return True
+        return id
 
     def read(self, id: str, field: Optional[str] = None) -> Optional[Union[str, Dict[str, str]]]:
         """
@@ -338,36 +341,37 @@ class RedisHashUtil:
     def copy(
         self,
         source_id: str,
-        dest_id: str,
+        dest_id: Optional[str] = None,
         overwrite: bool = False,
         ttl: Optional[int] = None,
-    ) -> bool:
+    ) -> str:
         """
         Copy a hash entry to a new id.
+        If dest_id is not provided, a UUID4 is auto-generated.
 
         Args:
             source_id: Source entry identifier.
-            dest_id: Destination entry identifier.
+            dest_id: Destination entry identifier. Auto-generated if None.
             overwrite: If True, overwrite existing destination.
             ttl: TTL for the copied entry. Overrides default_ttl if provided.
 
         Returns:
-            True if copy succeeded.
+            The destination id (provided or auto-generated).
 
         Raises:
             ValueError: If destination exists and overwrite is False.
         """
         data = self.read(source_id)
         if data is None:
-            return False
-        return self.create(dest_id, dict(data), overwrite=overwrite, ttl=ttl)
+            return ""
+        return self.create(dict(data), id=dest_id, overwrite=overwrite, ttl=ttl)
 
     def bulk_copy(
         self,
         copies: Dict[str, str],
         overwrite: bool = False,
         ttl: Optional[int] = None,
-    ) -> int:
+    ) -> Dict[str, str]:
         """
         Copy multiple hash entries using pipeline.
 
@@ -377,10 +381,10 @@ class RedisHashUtil:
             ttl: TTL for copied entries. Overrides default_ttl if provided.
 
         Returns:
-            Number of entries copied.
+            Dict mapping destination ids to themselves.
         """
         if not copies:
-            return 0
+            return {}
         source_ids = list(copies.keys())
         bulk_data = self.bulk_read(source_ids)
         new_entries: Dict[str, Dict[str, Any]] = {}
@@ -389,7 +393,7 @@ class RedisHashUtil:
             if data is not None:
                 new_entries[dest_id] = dict(data)
         if not new_entries:
-            return 0
+            return {}
         return self.bulk_create(new_entries, overwrite=overwrite, ttl=ttl)
 
     def rename(self, old_id: str, new_id: str, overwrite: bool = False) -> bool:
@@ -497,7 +501,7 @@ class RedisHashUtil:
         entries: Dict[str, Dict[str, Any]],
         overwrite: bool = False,
         ttl: Optional[int] = None,
-    ) -> int:
+    ) -> Dict[str, str]:
         """
         Create multiple hash entries using pipeline.
 
@@ -507,9 +511,9 @@ class RedisHashUtil:
             ttl: TTL in seconds. Overrides default_ttl if provided.
 
         Returns:
-            Number of entries created.
+            Dict mapping original ids to themselves (for API consistency).
         """
-        count = 0
+        ids_map: Dict[str, str] = {}
         pipe = self._sync_client.pipeline(transaction=False)
         for id, data in entries.items():
             key = self._key(id)
@@ -518,17 +522,17 @@ class RedisHashUtil:
             if overwrite:
                 pipe.delete(key)
             pipe.hset(key, mapping=data)
-            count += 1
+            ids_map[id] = id
         pipe.execute()
         # Apply TTL after pipeline since EXPIRE needs keys to exist
-        if count > 0:
+        if ids_map:
             effective_ttl = ttl if ttl is not None else self.default_ttl
             if effective_ttl is not None:
                 ttl_pipe = self._sync_client.pipeline(transaction=False)
-                for id in entries:
+                for id in ids_map:
                     ttl_pipe.expire(self._key(id), effective_ttl)
                 ttl_pipe.execute()
-        return count
+        return ids_map
 
     def bulk_read(self, ids: List[str]) -> Dict[str, Optional[Dict[str, str]]]:
         """Read multiple hash entries using pipeline."""
@@ -580,8 +584,36 @@ class RedisHashUtil:
         results = pipe.execute()
         return sum(results)
 
-    def get_all(self, pattern: Optional[str] = None, batch_size: int = 1000) -> Dict[str, Dict[str, str]]:
-        """Get all hash entries under this prefix using SCAN."""
+    def get_all(
+        self,
+        pattern: Optional[str] = None,
+        filter_by: Optional[Dict[str, str]] = None,
+        sort_by: Optional[str] = None,
+        sort_order: str = "asc",
+        offset: int = 0,
+        limit: int = 0,
+        batch_size: int = 1000,
+    ) -> Dict[str, Dict[str, str]]:
+        """
+        Get all hash entries under this prefix using SCAN with filtering,
+        sorting, and pagination.
+
+        Note: Redis does not support server-side filtering/sorting.
+        All data is collected first, then filtered/sorted/paginated in Python.
+
+        Args:
+            pattern: Optional sub-pattern to match (appended to prefix).
+            filter_by: Optional dict of field-value pairs to filter by.
+                       e.g., {"status": "active", "role": "admin"}
+            sort_by: Optional field name to sort entries by.
+            sort_order: Sort direction. "asc" or "desc". Default "asc".
+            offset: Number of entries to skip (for pagination).
+            limit: Maximum entries to return. 0 = no limit.
+            batch_size: Number of keys to scan per iteration.
+
+        Returns:
+            Dict mapping entry ids to their data.
+        """
         search = f"{self.prefix}:{pattern}*" if pattern else f"{self.prefix}:*"
         result: Dict[str, Dict[str, str]] = {}
         cursor = 0
@@ -594,9 +626,27 @@ class RedisHashUtil:
                 data_list = pipe.execute()
                 for key, data in zip(keys, data_list):
                     id = key.removeprefix(f"{self.prefix}:")
-                    result[id] = data
+                    if data:
+                        # Apply filter
+                        if filter_by:
+                            match = all(data.get(k) == v for k, v in filter_by.items())
+                            if not match:
+                                continue
+                        result[id] = data
             if cursor == 0:
                 break
+        # Sort
+        if sort_by:
+            result = dict(sorted(
+                result.items(),
+                key=lambda item: item[1].get(sort_by, ""),
+                reverse=(sort_order.lower() == "desc"),
+            ))
+        # Pagination
+        if offset > 0 or limit > 0:
+            items = list(result.items())
+            end = offset + limit if limit > 0 else None
+            result = dict(items[offset:end])
         return result
 
     def delete_all(self, pattern: Optional[str] = None, batch_size: int = 1000) -> int:
@@ -628,8 +678,25 @@ class RedisHashUtil:
                 break
         return count
 
-    def list_ids(self, pattern: Optional[str] = None, batch_size: int = 1000) -> List[str]:
-        """List all entry ids under this prefix."""
+    def list_ids(
+        self,
+        pattern: Optional[str] = None,
+        offset: int = 0,
+        limit: int = 0,
+        batch_size: int = 1000,
+    ) -> List[str]:
+        """
+        List entry ids under this prefix with optional pagination.
+
+        Args:
+            pattern: Optional sub-pattern to match.
+            offset: Number of ids to skip (for pagination).
+            limit: Maximum ids to return. 0 = no limit.
+            batch_size: Scan batch size.
+
+        Returns:
+            List of entry ids (without prefix).
+        """
         search = f"{self.prefix}:{pattern}*" if pattern else f"{self.prefix}:*"
         ids: List[str] = []
         cursor = 0
@@ -639,6 +706,10 @@ class RedisHashUtil:
                 ids.append(key.removeprefix(f"{self.prefix}:"))
             if cursor == 0:
                 break
+        # Pagination
+        if offset > 0 or limit > 0:
+            end = offset + limit if limit > 0 else None
+            return ids[offset:end]
         return ids
 
     # ──────────────────────────────────────────────
@@ -782,7 +853,7 @@ class RedisHashUtil:
         with open(filepath, "r", encoding="utf-8") as f:
             import_data = json.load(f)
         entries = import_data.get("entries", {})
-        return self.bulk_create(entries, overwrite=overwrite, ttl=ttl)
+        return len(self.bulk_create(entries, overwrite=overwrite, ttl=ttl))
 
     def export_json_string(self, pattern: Optional[str] = None, indent: int = 2) -> str:
         """
@@ -822,11 +893,7 @@ class RedisHashUtil:
         """
         import_data = json.loads(json_str)
         entries = import_data.get("entries", {})
-        return self.bulk_create(entries, overwrite=overwrite, ttl=ttl)
-
-    # ──────────────────────────────────────────────
-    # IMPORT / EXPORT — CSV
-    # ──────────────────────────────────────────────
+        return len(self.bulk_create(entries, overwrite=overwrite, ttl=ttl))
 
     def export_csv(
         self,
@@ -902,7 +969,7 @@ class RedisHashUtil:
             for row in reader:
                 entry_id = row.pop(id_column)
                 entries[entry_id] = {k: v for k, v in row.items() if v}
-        return self.bulk_create(entries, overwrite=overwrite, ttl=ttl)
+        return len(self.bulk_create(entries, overwrite=overwrite, ttl=ttl))
 
     def export_csv_string(
         self,
@@ -940,12 +1007,14 @@ class RedisHashUtil:
 
     async def async_create(
         self,
-        id: str,
         data: Dict[str, Any],
+        id: Optional[str] = None,
         overwrite: bool = False,
         ttl: Optional[int] = None,
-    ) -> bool:
-        """Async: Create a new hash entry or update if overwrite is True."""
+    ) -> str:
+        """Async: Create a new hash entry. Auto-generates UUID4 if id is None."""
+        if id is None:
+            id = self.generate_uuid4()
         key = self._key(id)
         if not overwrite and await self._async_client.exists(key):
             raise ValueError(f"Entry '{key}' already exists. Use overwrite=True to update.")
@@ -953,7 +1022,7 @@ class RedisHashUtil:
             await self._async_client.delete(key)
         await self._async_client.hset(key, mapping=data)
         await self._apply_ttl_async(key, ttl)
-        return True
+        return id
 
     async def async_read(self, id: str, field: Optional[str] = None) -> Optional[Union[str, Dict[str, str]]]:
         """Async: Read hash entry or specific field."""
@@ -1008,9 +1077,9 @@ class RedisHashUtil:
         entries: Dict[str, Dict[str, Any]],
         overwrite: bool = False,
         ttl: Optional[int] = None,
-    ) -> int:
+    ) -> Dict[str, str]:
         """Async: Create multiple hash entries using pipeline."""
-        count = 0
+        ids_map: Dict[str, str] = {}
         pipe = self._async_client.pipeline(transaction=False)
         for id, data in entries.items():
             key = self._key(id)
@@ -1019,16 +1088,16 @@ class RedisHashUtil:
             if overwrite:
                 pipe.delete(key)
             pipe.hset(key, mapping=data)
-            count += 1
+            ids_map[id] = id
         await pipe.execute()
-        if count > 0:
+        if ids_map:
             effective_ttl = ttl if ttl is not None else self.default_ttl
             if effective_ttl is not None:
                 ttl_pipe = self._async_client.pipeline(transaction=False)
-                for id in entries:
+                for id in ids_map:
                     ttl_pipe.expire(self._key(id), effective_ttl)
                 await ttl_pipe.execute()
-        return count
+        return ids_map
 
     async def async_bulk_read(self, ids: List[str]) -> Dict[str, Optional[Dict[str, str]]]:
         """Async: Read multiple hash entries using pipeline."""
@@ -1038,8 +1107,17 @@ class RedisHashUtil:
         results = await pipe.execute()
         return {id: (data if data else None) for id, data in zip(ids, results)}
 
-    async def async_get_all(self, pattern: Optional[str] = None, batch_size: int = 1000) -> Dict[str, Dict[str, str]]:
-        """Async: Get all hash entries under this prefix."""
+    async def async_get_all(
+        self,
+        pattern: Optional[str] = None,
+        filter_by: Optional[Dict[str, str]] = None,
+        sort_by: Optional[str] = None,
+        sort_order: str = "asc",
+        offset: int = 0,
+        limit: int = 0,
+        batch_size: int = 1000,
+    ) -> Dict[str, Dict[str, str]]:
+        """Async: Get all hash entries under this prefix with filtering, sorting, pagination."""
         search = f"{self.prefix}:{pattern}*" if pattern else f"{self.prefix}:*"
         result: Dict[str, Dict[str, str]] = {}
         cursor = 0
@@ -1052,9 +1130,24 @@ class RedisHashUtil:
                 data_list = await pipe.execute()
                 for key, data in zip(keys, data_list):
                     id = key.removeprefix(f"{self.prefix}:")
-                    result[id] = data
+                    if data:
+                        if filter_by:
+                            match = all(data.get(k) == v for k, v in filter_by.items())
+                            if not match:
+                                continue
+                        result[id] = data
             if cursor == 0:
                 break
+        if sort_by:
+            result = dict(sorted(
+                result.items(),
+                key=lambda item: item[1].get(sort_by, ""),
+                reverse=(sort_order.lower() == "desc"),
+            ))
+        if offset > 0 or limit > 0:
+            items = list(result.items())
+            end = offset + limit if limit > 0 else None
+            result = dict(items[offset:end])
         return result
 
     async def async_delete_all(self, pattern: Optional[str] = None, batch_size: int = 1000) -> int:
@@ -1294,8 +1387,7 @@ if __name__ == "__main__":
     users.delete_all()
 
     # Create with default_ttl (1 hour from init)
-    user_id = RedisHashUtil.generate_uuid4()
-    users.create(user_id, {
+    user_id = users.create({
         "username": "johndoe",
         "email": "john@example.com",
         "role": "admin",
@@ -1305,8 +1397,7 @@ if __name__ == "__main__":
     print(f"TTL after create: {users.ttl(user_id)}s")
 
     # Create with explicit TTL override (5 minutes)
-    session_id = RedisHashUtil.generate_uuid4()
-    users.create(session_id, {"token": "abc123"}, ttl=300)
+    session_id = users.create({"token": "abc123"}, ttl=300)
     print(f"Session TTL: {users.ttl(session_id)}s (overridden to 300)")
 
     # Read
@@ -1394,9 +1485,9 @@ if __name__ == "__main__":
 
     print("\n--- Search Operations ---")
     users.delete_all()
-    users.create("u1", {"username": "alice", "role": "admin"}, overwrite=True)
-    users.create("u2", {"username": "bob", "role": "user"}, overwrite=True)
-    users.create("u3", {"username": "charlie", "role": "admin"}, overwrite=True)
+    users.create({"username": "alice", "role": "admin"}, id="u1", overwrite=True)
+    users.create({"username": "bob", "role": "user"}, id="u2", overwrite=True)
+    users.create({"username": "charlie", "role": "admin"}, id="u3", overwrite=True)
 
     # Exact search
     admins = users.search("role", "admin")
@@ -1409,6 +1500,47 @@ if __name__ == "__main__":
     # Search with data
     admins_data = users.search_with_data("role", "admin")
     print(f"Admins with data:  {admins_data}")
+
+    # ── PAGINATION / SORT / FILTER ────────────
+
+    print("\n--- Pagination / Sort / Filter ---")
+    users.delete_all()
+    users.create({"username": "zara", "role": "admin", "age": "30"}, id="u1", overwrite=True)
+    users.create({"username": "alice", "role": "user", "age": "25"}, id="u2", overwrite=True)
+    users.create({"username": "mike", "role": "admin", "age": "35"}, id="u3", overwrite=True)
+    users.create({"username": "bob", "role": "user", "age": "28"}, id="u4", overwrite=True)
+
+    # Filter
+    admins_only = users.get_all(filter_by={"role": "admin"})
+    print(f"Filtered admins: {list(admins_only.keys())}")
+
+    # Sort (asc)
+    sorted_asc = users.get_all(sort_by="username", sort_order="asc")
+    print(f"Sorted asc: {list(sorted_asc.keys())}")
+
+    # Sort (desc)
+    sorted_desc = users.get_all(sort_by="username", sort_order="desc")
+    print(f"Sorted desc: {list(sorted_desc.keys())}")
+
+    # Pagination (offset + limit)
+    page1 = users.get_all(sort_by="username", offset=0, limit=2)
+    print(f"Page 1 (limit 2): {list(page1.keys())}")
+    page2 = users.get_all(sort_by="username", offset=2, limit=2)
+    print(f"Page 2 (limit 2): {list(page2.keys())}")
+
+    # Filter + Sort + Pagination combined
+    filtered_page = users.get_all(
+        filter_by={"role": "user"},
+        sort_by="username",
+        sort_order="desc",
+        offset=0,
+        limit=1,
+    )
+    print(f"Filtered + sorted + paginated: {list(filtered_page.keys())}")
+
+    # List IDs with pagination
+    ids_page = users.list_ids(offset=1, limit=2)
+    print(f"list_ids(offset=1, limit=2): {ids_page}")
 
     # ── INDEX OPERATIONS ─────────────────────
 
