@@ -1,190 +1,172 @@
 """
 Complete usage examples for the datetime_parser module.
-
-Run this file directly to see all examples in action:
-    python usage_examples.py
+Run this file directly to see all examples in action.
 """
 
 from datetime_parser import (
     convert_datetime,
-    resolve_timezone,
-    get_system_timezone,
+    format_iso,
     list_supported_timezones,
+    resolve_timezone,
+    string_to_timestamp,
+    timestamp_to_string,
 )
 
 
-def example_1_basic_utc():
-    """Parse a datetime string and convert to UTC only."""
+def example_1_timestamp_to_string():
+    """Convert Unix timestamp to human-readable string."""
     print("=" * 70)
-    print("EXAMPLE 1: Basic UTC Conversion")
+    print("EXAMPLE 1: Timestamp to String")
     print("=" * 70)
 
-    result = convert_datetime(
-        datetime_string="August 13, 2026 1:30 PM",
-        parse_to_utc=True,
+    # Seconds
+    result = timestamp_to_string(1786645200, output_timezone="IST")
+    print(f"Timestamp (seconds) : {result['original_timestamp']}")
+    print(f"Is Milliseconds     : {result['is_milliseconds']}")
+    print(f"UTC                 : {result['utc']}")
+    print(f"UTC ISO             : {result['utc_iso']}")
+    print(f"Formatted (IST)     : {result['formatted']}")
+    print()
+
+    # Milliseconds
+    result = timestamp_to_string(
+        1786645200000, output_timezone="PST"
     )
-
-    print(f"Original : {result['original_string']}")
-    print(f"Parsed   : {result['parsed_datetime']}")
-    print(f"UTC      : {result['utc']}")
-    print(f"Timestamp: {result['utc_timestamp']}")
+    print(f"Timestamp (ms)      : {result['original_timestamp']}")
+    print(f"Is Milliseconds     : {result['is_milliseconds']}")
+    print(f"Formatted (PST)     : {result['formatted']}")
     print()
 
 
-def example_2_system_time():
-    """Parse and convert to system timezone."""
+def example_2_string_to_timestamp():
+    """Convert human-readable string to Unix timestamp."""
     print("=" * 70)
-    print("EXAMPLE 2: System Timezone Conversion")
-    print("=" * 70)
-
-    result = convert_datetime(
-        datetime_string="13/08/2026 13:30",
-        parse_to_system=True,
-    )
-
-    print(f"Original  : {result['original_string']}")
-    print(f"Parsed    : {result['parsed_datetime']}")
-    print(f"System Tz : {result['system_timezone']}")
-    print(f"System    : {result['system']}")
-    print(f"Timestamp : {result['system_timestamp']}")
-    print()
-
-
-def example_3_custom_timezones():
-    """Parse and convert to multiple custom timezones."""
-    print("=" * 70)
-    print("EXAMPLE 3: Custom Timezone Conversions")
+    print("EXAMPLE 2: String to Timestamp")
     print("=" * 70)
 
-    result = convert_datetime(
-        datetime_string="2026-08-13T13:30:00",
-        parse_to=["IST", "PST", "EST", "JST"],
-        parse_to_system=False,
-        parse_to_utc=False,
-    )
-
-    print(f"Original: {result['original_string']}")
-    print(f"Parsed  : {result['parsed_datetime']}")
-    print()
-    for tz, data in result["custom_timezones"].items():
-        if data.get("error"):
-            print(f"  {tz}: ERROR - {data['error']}")
-        else:
-            print(f"  {tz:20} -> {data['datetime']:30} (ts: {data['timestamp']})")
-    print()
-
-
-def example_4_full_conversion():
-    """Parse with all options enabled."""
-    print("=" * 70)
-    print("EXAMPLE 4: Full Conversion (UTC + System + Custom)")
-    print("=" * 70)
-
-    result = convert_datetime(
-        datetime_string="August 1, 2026 10:00 AM",
-        parse_to=["Asia/Kolkata", "America/New_York"],
-        parse_to_system=True,
-        parse_to_utc=True,
-    )
-
+    result = string_to_timestamp("August 13, 2026 1:30 PM")
     print(f"Original    : {result['original_string']}")
-    print(f"Parsed      : {result['parsed_datetime']}")
-    print(f"Timestamp   : {result['parsed_timestamp']}")
-    print(f"UTC         : {result['utc']}")
-    print(f"UTC ts      : {result['utc_timestamp']}")
-    print(f"System Tz   : {result['system_timezone']}")
-    print(f"System      : {result['system']}")
-    print(f"System ts   : {result['system_timestamp']}")
-    print(f"Custom Tzs  : (skipped when parse_to_system=True)")
+    print(f"Is Parsed   : {result['is_parsed']}")
+    print(f"Timestamp   : {result['timestamp_seconds']}")
+    print(f"Timestamp ms: {result['timestamp_milliseconds']}")
+    print(f"ISO 8601    : {result['iso_8601']}")
+    print()
+
+    result = string_to_timestamp("13/08/2026 13:30")
+    print(f"Original    : {result['original_string']}")
+    print(f"Timestamp   : {result['timestamp_seconds']}")
+    print(f"ISO 8601    : {result['iso_8601']}")
     print()
 
 
-def example_5_relative_dates():
-    """Parse relative datetime strings like 'tomorrow', '2 hours ago'."""
+def example_3_format_iso():
+    """Parse a datetime and reformat it to a custom format."""
     print("=" * 70)
-    print("EXAMPLE 5: Relative Date Strings")
-    print("=" * 70)
-
-    relative_strings = [
-        "Tomorrow at 10 AM",
-        "Next Friday at 3:30 PM",
-        "2 hours ago",
-        "Last Monday at 9 AM",
-    ]
-
-    for date_str in relative_strings:
-        result = convert_datetime(
-            datetime_string=date_str,
-            parse_to_system=True,
-            parse_to_utc=True,
-        )
-        print(f"Input    : {date_str}")
-        print(f"UTC      : {result['utc']}")
-        print(f"System   : {result['system']}")
-        print()
-
-
-def example_6_various_formats():
-    """Parse datetime in various input formats."""
-    print("=" * 70)
-    print("EXAMPLE 6: Various Input Formats")
+    print("EXAMPLE 3: Format / Reformat Datetime")
     print("=" * 70)
 
-    formats = [
-        "2026-08-13 13:30:00",
-        "August 13, 2026 1:30 PM",
+    result = format_iso(
         "13/08/2026 13:30",
-        "13th August 2026 1:30 PM",
-        "Aug 13, 2026 at 1:30 PM",
-        "13.08.2026 13:30",
-    ]
-
-    for fmt in formats:
-        result = convert_datetime(
-            datetime_string=fmt,
-            parse_to_utc=True,
-        )
-        status = "OK" if result["is_parsed"] else "FAIL"
-        print(f"  [{status}] {fmt:45} -> UTC: {result['utc']}")
-    print()
-
-
-def example_7_error_handling():
-    """Demonstrate graceful error handling."""
-    print("=" * 70)
-    print("EXAMPLE 7: Error Handling")
-    print("=" * 70)
-
-    result = convert_datetime(
-        datetime_string="not a real date at all",
-        parse_to_utc=True,
+        output_format="%Y-%m-%d %I:%M:%S %p %Z",
+        output_timezone="IST",
     )
+    print(f"Input   : {result['original_string']}")
+    print(f"Output  : {result['formatted']}")
+    print(f"ISO 8601: {result['iso_8601']}")
+    print()
 
-    print(f"Original : {result['original_string']}")
-    print(f"Parsed   : {result['is_parsed']}")
-    print(f"Error    : {result['error']}")
+    result = format_iso(
+        "August 13, 2026 1:30 PM",
+        output_format="%d/%m/%Y %H:%M",
+        output_timezone="UTC",
+    )
+    print(f"Input   : {result['original_string']}")
+    print(f"Output  : {result['formatted']}")
+    print(f"ISO 8601: {result['iso_8601']}")
+    print()
+
+    # Common formats
+    formats = {
+        "Default": "%Y-%m-%d %I:%M:%S %p %Z",
+        "Date Only": "%Y-%m-%d",
+        "Time Only": "%I:%M:%S %p",
+        "European": "%d/%m/%Y %H:%M",
+        "US Format": "%m/%d/%Y %I:%M %p",
+        "File Safe": "%Y-%m-%d_%H-%M-%S",
+        "Short": "%b %d, %Y %I:%M %p",
+    }
+
+    print("Common Format Examples:")
+    for name, fmt in formats.items():
+        result = format_iso(
+            "August 13, 2026 1:30 PM",
+            output_format=fmt,
+            output_timezone="IST",
+        )
+        print(f"  {name:15} -> {result['formatted']}")
     print()
 
 
-def example_8_helper_functions():
-    """Demonstrate helper functions."""
+def example_4_bidirectional():
+    """Demonstrate full round-trip: String -> Timestamp -> String."""
     print("=" * 70)
-    print("EXAMPLE 8: Helper Functions")
+    print("EXAMPLE 4: Round-Trip Conversion (String -> TS -> String)")
     print("=" * 70)
 
-    # Resolve timezone
-    tz = resolve_timezone("IST")
-    print(f"resolve_timezone('IST') -> {tz}")
+    original = "August 13, 2026 1:30 PM"
 
-    # Get system timezone
-    name, iana = get_system_timezone()
-    print(f"get_system_timezone()  -> {name} ({iana})")
+    # Step 1: String to Timestamp
+    to_ts = string_to_timestamp(original)
+    print(f"Original String     : {original}")
+    print(f"Timestamp (seconds) : {to_ts['timestamp_seconds']}")
+    print()
 
-    # List supported timezones
-    all_tzs = list_supported_timezones()
-    print(f"list_supported_timezones() -> {len(all_tzs)} timezones")
-    for tz in all_tzs[:5]:
-        print(f"  {tz['alias']:8} -> {tz['iana']}")
+    # Step 2: Timestamp back to String
+    to_str = timestamp_to_string(
+        to_ts["timestamp_seconds"], output_timezone="IST"
+    )
+    print(f"Timestamp           : {to_str['original_timestamp']}")
+    print(f"Back to String (IST): {to_str['formatted']}")
+    print()
+
+    # Step 3: Verify
+    print(f"Match: {original} -> timestamp -> {to_str['formatted']}")
+    print()
+
+
+def example_5_common_use_cases():
+    """Show common real-world use cases."""
+    print("=" * 70)
+    print("EXAMPLE 5: Common Use Cases")
+    print("=" * 70)
+
+    # Use case 1: API response has timestamp, need string
+    print("Use Case 1: API timestamp to readable string")
+    api_timestamp = 1786645200
+    result = timestamp_to_string(api_timestamp, output_timezone="IST")
+    print(f"  API gave: {api_timestamp}")
+    print(f"  You see : {result['formatted']}")
+    print()
+
+    # Use case 2: User input needs to be stored as timestamp
+    print("Use Case 2: User input to timestamp for database")
+    user_input = "Next Friday at 3 PM"
+    result = string_to_timestamp(user_input)
+    print(f"  User typed : {user_input}")
+    print(f"  Store in DB: {result['timestamp_seconds']}")
+    print(f"  ISO 8601   : {result['iso_8601']}")
+    print()
+
+    # Use case 3: Convert between formats
+    print("Use Case 3: Reformat for display")
+    db_date = "2026-08-13T13:30:00+05:30"
+    result = format_iso(
+        db_date,
+        output_format="%B %d, %Y at %I:%M %p",
+        output_timezone="America/New_York",
+    )
+    print(f"  Database has : {db_date}")
+    print(f"  Display to US: {result['formatted']}")
     print()
 
 
@@ -197,14 +179,11 @@ if __name__ == "__main__":
     print(" DATETIME_PARSER MODULE - COMPLETE USAGE EXAMPLES")
     print("=" * 70 + "\n")
 
-    example_1_basic_utc()
-    example_2_system_time()
-    example_3_custom_timezones()
-    example_4_full_conversion()
-    example_5_relative_dates()
-    example_6_various_formats()
-    example_7_error_handling()
-    example_8_helper_functions()
+    example_1_timestamp_to_string()
+    example_2_string_to_timestamp()
+    example_3_format_iso()
+    example_4_bidirectional()
+    example_5_common_use_cases()
 
     print("=" * 70)
     print(" ALL EXAMPLES COMPLETED SUCCESSFULLY")
