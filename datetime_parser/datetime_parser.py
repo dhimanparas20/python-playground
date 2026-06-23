@@ -762,3 +762,245 @@ def _resolve_timezone(tz_string: str) -> ZoneInfo:
         f"(e.g., 'IST', 'PST'). Run list_supported_timezones() to see "
         f"all supported timezones."
     )
+
+
+# ======================================================================
+# NEW PUBLIC API: Timestamp & ISO Conversion
+# ======================================================================
+
+
+def timestamp_to_string(
+    timestamp: int | float,
+    output_timezone: str = "Asia/Kolkata",
+    output_format: str = "%Y-%m-%d %I:%M:%S %p %Z",
+) -> dict[str, Any]:
+    """
+    Convert a Unix timestamp (seconds or milliseconds) to a human-readable
+    datetime string.
+
+    Args:
+        timestamp (int | float): The Unix timestamp to convert.
+            Supports both seconds (e.g., 1786645200) and milliseconds
+            (e.g., 1786645200000). The function auto-detects based on
+            magnitude (if > 1e12, assumes milliseconds).
+
+        output_timezone (str): The timezone to display the result in.
+            Accepts aliases (e.g., "IST", "PST") or IANA names
+            (e.g., "Asia/Kolkata", "America/New_York").
+
+        output_format (str): The strftime format string to use for
+            formatting the output. Defaults to "%Y-%m-%d %I:%M:%S %p %Z".
+
+    Returns:
+        dict[str, Any]: A dictionary containing:
+            - "original_timestamp" (int | float): The original timestamp.
+            - "is_milliseconds" (bool): Whether input was in milliseconds.
+            - "utc" (str): UTC datetime string.
+            - "utc_iso" (str): UTC ISO 8601 string.
+            - "formatted" (str): Formatted datetime in requested timezone.
+            - "timezone" (str): The timezone used for formatting.
+            - "error" (str | None): Error message if conversion failed.
+
+    Examples:
+        >>> result = timestamp_to_string(1786645200)
+        >>> print(result["formatted"])
+        "2026-08-13 01:30:00 PM IST"
+
+        >>> result = timestamp_to_string(1786645200000, output_timezone="PST")
+        >>> print(result["formatted"])
+        "2026-08-13 01:00:00 AM PDT"
+    """
+    response: dict[str, Any] = {
+        "original_timestamp": timestamp,
+        "is_milliseconds": False,
+        "utc": None,
+        "utc_iso": None,
+        "formatted": None,
+        "timezone": output_timezone,
+        "error": None,
+    }
+
+    try:
+        # Step 1: Auto-detect milliseconds vs seconds
+        ts = float(timestamp)
+        if ts > 1e12:
+            ts = ts / 1000.0
+            response["is_milliseconds"] = True
+
+        # Step 2: Create UTC datetime from timestamp
+        utc_dt = datetime.fromtimestamp(ts, tz=ZoneInfo("UTC"))
+        response["utc"] = utc_dt.strftime("%Y-%m-%d %I:%M:%S %p UTC")
+        response["utc_iso"] = utc_dt.isoformat()
+
+        # Step 3: Convert to requested timezone
+        target_tz = _resolve_timezone(output_timezone)
+        local_dt = utc_dt.astimezone(target_tz)
+        response["formatted"] = local_dt.strftime(output_format)
+
+        logger.debug(
+            f"Timestamp conversion: {timestamp} -> {response['formatted']}"
+        )
+
+    except Exception as e:
+        response["error"] = f"Conversion failed: {str(e)}"
+        logger.error(response["error"])
+
+    return response
+
+
+def string_to_timestamp(
+    datetime_string: str,
+    input_timezone: str = "Asia/Kolkata",
+) -> dict[str, Any]:
+    """
+    Convert a human-readable datetime string to a Unix timestamp.
+
+    This is essentially a wrapper around ``convert_datetime`` that returns
+    the timestamp directly.
+
+    Args:
+        datetime_string (str): The datetime string to convert. Can be in any
+            format supported by ``dateparser``.
+
+        input_timezone (str): The timezone to assume for naive datetimes.
+            Defaults to "Asia/Kolkata".
+
+    Returns:
+        dict[str, Any]: A dictionary containing:
+            - "original_string" (str): The original datetime string.
+            - "is_parsed" (bool): Whether parsing was successful.
+            - "timestamp_seconds" (int): Unix timestamp in seconds.
+            - "timestamp_milliseconds" (int): Unix timestamp in milliseconds.
+            - "iso_8601" (str): ISO 8601 formatted string.
+            - "error" (str | None): Error message if conversion failed.
+
+    Examples:
+        >>> result = string_to_timestamp("August 13, 2026 1:30 PM")
+        >>> print(result["timestamp_seconds"])
+        1786680000
+
+        >>> print(result["timestamp_milliseconds"])
+        1786680000000
+    """
+    response: dict[str, Any] = {
+        "original_string": datetime_string,
+        "is_parsed": False,
+        "timestamp_seconds": None,
+        "timestamp_milliseconds": None,
+        "iso_8601": None,
+        "error": None,
+    }
+
+    try:
+        # Step 1: Parse the string
+        parsed_dt = dateparser_parse(datetime_string)
+        if parsed_dt is None:
+            response["error"] = (
+                f"Could not parse the datetime string: '{datetime_string}'"
+            )
+            return response
+
+        response["is_parsed"] = True
+
+        # Step 2: Attach timezone if naive
+        if parsed_dt.tzinfo is None:
+            target_tz = _resolve_timezone(input_timezone)
+            parsed_dt = parsed_dt.replace(tzinfo=target_tz)
+
+        # Step 3: Convert to timestamps
+        response["timestamp_seconds"] = int(parsed_dt.timestamp())
+        response["timestamp_milliseconds"] = int(parsed_dt.timestamp() * 1000)
+        response["iso_8601"] = parsed_dt.isoformat()
+
+        logger.debug(
+            f"String to timestamp: '{datetime_string}' -> "
+            f"{response['timestamp_seconds']}"
+        )
+
+    except Exception as e:
+        response["error"] = f"Conversion failed: {str(e)}"
+        logger.error(response["error"])
+
+    return response
+
+
+def format_iso(
+    datetime_string: str,
+    output_format: str = "%Y-%m-%d %I:%M:%S %p %Z",
+    output_timezone: str = "Asia/Kolkata",
+) -> dict[str, Any]:
+    """
+    Parse a datetime string and reformat it to a custom output format.
+
+    Useful when you have a datetime in one format and need it in another.
+
+    Args:
+        datetime_string (str): The input datetime string.
+
+        output_format (str): The desired output strftime format.
+            Defaults to "%Y-%m-%d %I:%M:%S %p %Z".
+
+        output_timezone (str): The timezone for the output.
+
+    Returns:
+        dict[str, Any]: A dictionary containing:
+            - "original_string" (str): The original datetime string.
+            - "is_parsed" (bool): Whether parsing was successful.
+            - "formatted" (str): The reformatted datetime string.
+            - "iso_8601" (str): ISO 8601 formatted string.
+            - "error" (str | None): Error message if conversion failed.
+
+    Examples:
+        >>> result = format_iso("13/08/2026 13:30")
+        >>> print(result["formatted"])
+        "2026-08-13 01:30:00 PM IST"
+
+        >>> result = format_iso(
+        ...     "August 13, 2026 1:30 PM",
+        ...     output_format="%d/%m/%Y %H:%M",
+        ...     output_timezone="UTC",
+        ... )
+        >>> print(result["formatted"])
+        "13/08/2026 08:00"
+    """
+    response: dict[str, Any] = {
+        "original_string": datetime_string,
+        "is_parsed": False,
+        "formatted": None,
+        "iso_8601": None,
+        "error": None,
+    }
+
+    try:
+        # Step 1: Parse the string
+        parsed_dt = dateparser_parse(datetime_string)
+        if parsed_dt is None:
+            response["error"] = (
+                f"Could not parse the datetime string: '{datetime_string}'"
+            )
+            return response
+
+        response["is_parsed"] = True
+
+        # Step 2: Attach timezone if naive
+        if parsed_dt.tzinfo is None:
+            target_tz = _resolve_timezone(output_timezone)
+            parsed_dt = parsed_dt.replace(tzinfo=target_tz)
+
+        # Step 3: Convert to output timezone
+        target_tz = _resolve_timezone(output_timezone)
+        converted_dt = parsed_dt.astimezone(target_tz)
+
+        # Step 4: Format the output
+        response["formatted"] = converted_dt.strftime(output_format)
+        response["iso_8601"] = converted_dt.isoformat()
+
+        logger.debug(
+            f"Format ISO: '{datetime_string}' -> '{response['formatted']}'"
+        )
+
+    except Exception as e:
+        response["error"] = f"Conversion failed: {str(e)}"
+        logger.error(response["error"])
+
+    return response
