@@ -4,23 +4,26 @@ datetime_parser - A production-level datetime parsing and conversion module.
 This module provides a robust solution for parsing datetime strings in various
 formats and converting them across multiple timezones. It leverages the
 `dateparser` library for flexible input parsing and Python's `zoneinfo` for
-accurate timezone handling.
+accururate timezone handling.
 
 Key Features:
     - Parse datetime strings in virtually any human-readable format.
     - Convert parsed datetime to UTC, system timezone, or custom timezones.
-    - Supports common timezone aliases (e.g., 'IST', 'PST') and IANA names.
+    - Supports both common abbreviations (e.g., 'IST', 'PST') and full IANA
+      timezone names (e.g., 'Asia/Kolkata', 'America/New_York').
+    - 100+ timezone aliases covering major countries worldwide.
     - Returns structured dictionaries with ISO strings and Unix timestamps.
     - Graceful error handling with detailed error messages.
 
 Author: T3 Chat
-Version: 1.0.0
+Version: 3.0.0
 Date: 2026-06-23
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 from datetime import datetime
 from typing import Any, Optional
 
@@ -31,60 +34,295 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 # Module-level configuration
 # ======================================================================
 
-__version__ = "1.0.0"
+__version__ = "3.0.0"
 __author__ = "T3 Chat"
 
 logger = logging.getLogger(__name__)
 
 # Default timezone used when input datetime is naive (no timezone info)
-DEFAULT_TIMEZONE = "Asia/Kolkata"
+DEFAULT_TIMEZONE: str = "Asia/Kolkata"
 
-# Common timezone aliases mapped to IANA timezone strings
+# ======================================================================
+# Timezone Aliases
+# Covers 100+ countries/regions with common abbreviations mapped to
+# their official IANA timezone strings.
+# ======================================================================
+
 TZ_ALIASES: dict[str, str] = {
-    # South Asia
-    "IST": "Asia/Kolkata",
-    "SLST": "Asia/Colombo",
-    "BST": "Asia/Dhaka",
-    
-    # North America
-    "PST": "America/Los_Angeles",
-    "PDT": "America/Los_Angeles",
-    "EST": "America/New_York",
-    "EDT": "America/New_York",
-    "CST": "America/Chicago",
-    "CDT": "America/Chicago",
-    "MST": "America/Denver",
-    "MDT": "America/Denver",
-    "HST": "Pacific/Honolulu",
-    "NST": "America/St_Johns",
-    
-    # Europe
-    "GMT": "Europe/London",
-    "CET": "Europe/Berlin",
-    "CEST": "Europe/Berlin",
-    "EET": "Europe/Athens",
-    "EEST": "Europe/Athens",
-    "MSK": "Europe/Moscow",
-    
-    # Asia
-    "JST": "Asia/Tokyo",
-    "KST": "Asia/Seoul",
-    "SGT": "Asia/Singapore",
-    "HKT": "Asia/Hong_Kong",
-    "CST_CN": "Asia/Shanghai",
-    "IST_IL": "Asia/Jerusalem",
-    
-    # Oceania
-    "AEST": "Australia/Sydney",
-    "AEDT": "Australia/Sydney",
-    "NZST": "Pacific/Auckland",
-    "NZDT": "Pacific/Auckland",
-    
-    # South America
-    "BRT": "America/Sao_Paulo",
-    "ART": "America/Argentina/Buenos_Aires",
-    "CLT": "America/Santiago",
+    # ──────────────────────────────────────────────
+    # SOUTH ASIA
+    # ──────────────────────────────────────────────
+    "IST": "Asia/Kolkata",          # India Standard Time
+    "SLST": "Asia/Colombo",         # Sri Lanka Standard Time
+    "BST_BD": "Asia/Dhaka",         # Bangladesh Standard Time
+    "NPT": "Asia/Kathmandu",        # Nepal Time
+    "BTT": "Asia/Thimphu",          # Bhutan Time
+    "PKT": "Asia/Karachi",          # Pakistan Standard Time
+    "AFT": "Asia/Kabul",            # Afghanistan Time
+    "MVT": "Indian/Maldives",       # Maldives Time
+
+    # ──────────────────────────────────────────────
+    # SOUTHEAST ASIA
+    # ──────────────────────────────────────────────
+    "ICT": "Asia/Bangkok",          # Indochina Time
+    "SGT": "Asia/Singapore",        # Singapore Time
+    "MYT": "Asia/Kuala_Lumpur",     # Malaysia Time
+    "WIB": "Asia/Jakarta",          # Western Indonesian Time
+    "WITA": "Asia/Makassar",        # Central Indonesian Time
+    "WIT": "Asia/Jayapura",         # Eastern Indonesian Time
+    "PHT": "Asia/Manila",           # Philippine Time
+    "SGT_PH": "Asia/Manila",        # Philippine Time (alt)
+    "ICT_VN": "Asia/Ho_Chi_Minh",   # Vietnam Time
+    "MMT": "Asia/Yangon",           # Myanmar Time
+    "TLT": "Asia/Dili",             # Timor-Leste Time
+
+    # ──────────────────────────────────────────────
+    # EAST ASIA
+    # ──────────────────────────────────────────────
+    "JST": "Asia/Tokyo",            # Japan Standard Time
+    "KST": "Asia/Seoul",            # Korea Standard Time
+    "CST_CN": "Asia/Shanghai",      # China Standard Time
+    "HKT": "Asia/Hong_Kong",        # Hong Kong Time
+    "CST_TW": "Asia/Taipei",        # Taiwan Time
+    "ULAT": "Asia/Ulaanbaatar",     # Ulaanbaatar Time
+    "PHT2": "Asia/Manila",          # Philippines (alt)
+    "GNST": "Asia/Guam",            # Chamorro Standard Time
+
+    # ──────────────────────────────────────────────
+    # MIDDLE EAST
+    # ──────────────────────────────────────────────
+    "AST_SA": "Asia/Riyadh",        # Arabian Standard Time (Saudi Arabia)
+    "AST_BH": "Asia/Bahrain",       # Bahrain Time
+    "AST_QA": "Asia/Qatar",         # Qatar Time
+    "AST_KW": "Asia/Kuwait",        # Kuwait Time
+    "AST_AE": "Asia/Dubai",         # Gulf Standard Time (UAE)
+    "AST_OM": "Asia/Muscat",        # Oman Time
+    "AST_IQ": "Asia/Baghdad",       # Arabia Standard Time (Iraq)
+    "AST_SY": "Asia/Damascus",      # Syria Time
+    "AST_JO": "Asia/Amman",         # Jordan Time
+    "AST_LB": "Asia/Beirut",        # Lebanon Time
+    "AST_IL": "Asia/Jerusalem",     # Israel Standard Time
+    "AST_PS": "Asia/Gaza",          # Palestine Time
+    "IRST": "Asia/Tehran",          # Iran Standard Time
+    "TRT": "Europe/Istanbul",       # Turkey Time
+    "AZT": "Asia/Baku",             # Azerbaijan Time
+    "GET": "Asia/Tbilisi",          # Georgia Time
+    "AMT_AM": "Asia/Yerevan",       # Armenia Time
+    "AZST": "Asia/Baku",            # Azerbaijan Summer Time
+
+    # ──────────────────────────────────────────────
+    # CENTRAL ASIA
+    # ──────────────────────────────────────────────
+    "UZT": "Asia/Tashkent",         # Uzbekistan Time
+    "TMT": "Asia/Ashgabat",         # Turkmenistan Time
+    "KGT": "Asia/Bishkek",          # Kyrgyzstan Time
+    "TJT": "Asia/Dushanbe",         # Tajikistan Time
+    "KAZ": "Asia/Almaty",           # Kazakhstan Time (Almaty)
+    "KZT_NUR": "Asia/Almaty",       # Kazakhstan (Nur-Sultan)
+    "AQTT": "Asia/Aqtau",           # Aqtau Time
+
+    # ──────────────────────────────────────────────
+    # EUROPE (WEST)
+    # ──────────────────────────────────────────────
+    "GMT": "Europe/London",          # Greenwich Mean Time
+    "BST": "Europe/London",          # British Summer Time
+    "IST_IE": "Europe/Dublin",       # Irish Standard Time
+    "WET": "Europe/Lisbon",          # Western European Time
+    "WEST": "Europe/Lisbon",         # Western European Summer Time
+    "CET": "Europe/Berlin",          # Central European Time
+    "CEST": "Europe/Berlin",         # Central European Summer Time
+    "MET": "Europe/Amsterdam",       # Middle European Time
+    "MEST": "Europe/Amsterdam",      # Middle European Summer Time
+    "PST_PT": "Europe/Lisbon",       # Portugal Standard Time
+
+    # ──────────────────────────────────────────────
+    # EUROPE (EAST)
+    # ──────────────────────────────────────────────
+    "EET": "Europe/Athens",          # Eastern European Time
+    "EEST": "Europe/Athens",         # Eastern European Summer Time
+    "MSK": "Europe/Moscow",          # Moscow Standard Time
+    "FET": "Europe/Minsk",           # Further Eastern European Time
+    "EET_FI": "Europe/Helsinki",     # Finland Time
+    "EET_RO": "Europe/Bucharest",    # Romania Time
+    "EET_BG": "Europe/Sofia",        # Bulgaria Time
+    "EET_UA": "Europe/Kiev",         # Ukraine Time
+    "EET_MD": "Europe/Chisinau",     # Moldova Time
+    "EET_LT": "Europe/Vilnius",      # Lithuania Time
+    "EET_LV": "Europe/Riga",         # Latvia Time
+    "EET_EE": "Europe/Tallinn",      # Estonia Time
+    "EET_GR": "Europe/Athens",       # Greece Time
+    "EET_RS": "Europe/Belgrade",     # Serbia Time
+    "EET_HR": "Europe/Zagreb",       # Croatia Time
+    "EET_SI": "Europe/Ljubljana",    # Slovenia Time
+    "EET_SK": "Europe/Bratislava",   # Slovakia Time
+    "EET_CZ": "Europe/Prague",       # Czech Time
+    "CET_PL": "Europe/Warsaw",       # Poland Time
+    "CET_HU": "Europe/Budapest",     # Hungary Time
+
+    # ──────────────────────────────────────────────
+    # RUSSIA
+    # ──────────────────────────────────────────────
+    "YEKT": "Asia/Yekaterinburg",    # Yekaterinburg Time
+    "OMST": "Asia/Omsk",             # Omsk Time
+    "KRAS": "Asia/Krasnoyarsk",      # Krasnoyarsk Time
+    "IRKT": "Asia/Irkutsk",          # Irkutsk Time
+    "YAKT": "Asia/Yakutsk",          # Yakutsk Time
+    "VLAT": "Asia/Vladivostok",      # Vladivostok Time
+    "MAGT": "Asia/Magadan",          # Magadan Time
+    "PETT": "Asia/Kamchatka",        # Kamchatka Time
+    "SAKT": "Asia/Sakhalin",         # Sakhalin Time
+
+    # ──────────────────────────────────────────────
+    # NORTH AMERICA
+    # ──────────────────────────────────────────────
+    "EST": "America/New_York",        # Eastern Standard Time
+    "EDT": "America/New_York",        # Eastern Daylight Time
+    "CST": "America/Chicago",         # Central Standard Time
+    "CDT": "America/Chicago",         # Central Daylight Time
+    "MST": "America/Denver",          # Mountain Standard Time
+    "MDT": "America/Denver",          # Mountain Daylight Time
+    "PST": "America/Los_Angeles",     # Pacific Standard Time
+    "PDT": "America/Los_Angeles",     # Pacific Daylight Time
+    "AKST": "America/Anchorage",      # Alaska Standard Time
+    "AKDT": "America/Anchorage",      # Alaska Daylight Time
+    "HST": "Pacific/Honolulu",        # Hawaii Standard Time
+    "NST": "America/St_Johns",        # Newfoundland Standard Time
+    "NDT": "America/St_Johns",        # Newfoundland Daylight Time
+
+    # ──────────────────────────────────────────────
+    # CANADA
+    # ──────────────────────────────────────────────
+    "PST_CA": "America/Vancouver",    # Pacific (Canada)
+    "MST_CA": "America/Edmonton",     # Mountain (Canada)
+    "CST_CA": "America/Winnipeg",     # Central (Canada)
+    "EST_CA": "America/Toronto",      # Eastern (Canada)
+    "NST_CA": "America/St_Johns",     # Newfoundland (Canada)
+
+    # ──────────────────────────────────────────────
+    # MEXICO & CENTRAL AMERICA
+    # ──────────────────────────────────────────────
+    "CST_MX": "America/Mexico_City",  # Mexico City Time
+    "PST_MX": "America/Tijuana",      # Tijuana Time
+    "MST_MX": "America/Chihuahua",    # Chihuahua Time
+    "CST_CR": "America/Costa_Rica",   # Costa Rica Time
+    "CST_GT": "America/Guatemala",    # Guatemala Time
+    "CST_HN": "America/Tegucigalpa",  # Honduras Time
+    "CST_SV": "America/El_Salvador",  # El Salvador Time
+    "CST_NI": "America/Managua",      # Nicaragua Time
+    "CST_PA": "America/Panama",       # Panama Time
+    "CST_BZ": "America/Belize",       # Belize Time
+    "CST_HN": "America/Tegucigalpa",  # Honduras Time
+    "EST_CU": "America/Havana",       # Cuba Time
+
+    # ──────────────────────────────────────────────
+    # SOUTH AMERICA
+    # ──────────────────────────────────────────────
+    "BRT": "America/Sao_Paulo",       # Brasilia Time (Brazil)
+    "ART": "America/Argentina/Buenos_Aires", # Argentina Time
+    "CLT": "America/Santiago",        # Chile Time
+    "UYT": "America/Montevideo",      # Uruguay Time
+    "PYT": "America/Asuncion",        # Paraguay Time
+    "BOT": "America/La_Paz",          # Bolivia Time
+    "PET": "America/Lima",            # Peru Time
+    "ECT": "America/Guayaquil",       # Ecuador Time
+    "VET": "America/Caracas",         # Venezuela Time
+    "GFT": "America/Cayenne",         # French Guiana Time
+    "SRT": "America/Paramaribo",      # Suriname Time
+    "GYT": "America/Guyana",          # Guyana Time
+
+    # ──────────────────────────────────────────────
+    # AFRICA (NORTH)
+    # ──────────────────────────────────────────────
+    "WAT_NG": "Africa/Lagos",         # West Africa Time (Nigeria)
+    "WAT": "Africa/Lagos",            # West Africa Time
+    "CAT": "Africa/Harare",           # Central Africa Time
+    "EAT": "Africa/Nairobi",          # East Africa Time
+    "SAST": "Africa/Johannesburg",    # South Africa Standard Time
+    "CAT_CD": "Africa/Kinshasa",      # DR Congo (West)
+    "CAT_TZ": "Africa/Dar_es_Salaam", # Tanzania Time
+    "EAT_UG": "Africa/Kampala",       # Uganda Time
+    "EAT_ET": "Africa/Addis_Ababa",   # Ethiopia Time
+    "EAT_KE": "Africa/Nairobi",       # Kenya Time
+    "EAT_RW": "Africa/Kigali",        # Rwanda Time
+    "EAT_BI": "Africa/Bujumbura",     # Burundi Time
+    "WAT_AO": "Africa/Luanda",        # Angola Time
+    "WAT_GA": "Africa/Libreville",    # Gabon Time
+    "WAT_CG": "Africa/Brazzaville",   # Congo Time
+    "WAT_CM": "Africa/Douala",        # Cameroon Time
+    "WAT_TD": "Africa/Ndjamena",      # Chad Time
+    "WAT_CF": "Africa/Bangui",        # Central African Republic Time
+    "WAT_ST": "Africa/Sao_Tome",      # Sao Tome Time
+    "WAT_NE": "Africa/Niamey",        # Niger Time
+    "WAT_ML": "Africa/Bamako",        # Mali Time
+    "WAT_BF": "Africa/Ouagadougou",   # Burkina Faso Time
+    "WAT_GN": "Africa/Conakry",       # Guinea Time
+    "WAT_CI": "Africa/Abidjan",       # Ivory Coast Time
+    "WAT_SN": "Africa/Dakar",         # Senegal Time
+    "WAT_GM": "Africa/Banjul",        # Gambia Time
+    "WAT_GW": "Africa/Bissau",        # Guinea-Bissau Time
+    "WAT_CV": "Atlantic/Cape_Verde",  # Cape Verde Time
+
+    # ──────────────────────────────────────────────
+    # AFRICA (OTHER)
+    # ──────────────────────────────────────────────
+    "CAT_MW": "Africa/Blantyre",      # Malawi Time
+    "CAT_ZM": "Africa/Lusaka",        # Zambia Time
+    "CAT_ZW": "Africa/Harare",        # Zimbabwe Time
+    "CAT_BW": "Africa/Gaborone",      # Botswana Time
+    "CAT_NA": "Africa/Windhoek",      # Namibia Time
+    "CAT_MZ": "Africa/Maputo",        # Mozambique Time
+    "CAT_SZ": "Africa/Mbabane",       # Eswatini Time
+    "CAT_LS": "Africa/Maseru",        # Lesotho Time
+
+    # ──────────────────────────────────────────────
+    # OCEANIA
+    # ──────────────────────────────────────────────
+    "AEST": "Australia/Sydney",        # Australian Eastern Standard Time
+    "AEDT": "Australia/Sydney",        # Australian Eastern Daylight Time
+    "ACST": "Australia/Adelaide",      # Australian Central Standard Time
+    "ACDT": "Australia/Adelaide",      # Australian Central Daylight Time
+    "AWST": "Australia/Perth",         # Australian Western Standard Time
+    "NZST": "Pacific/Auckland",        # New Zealand Standard Time
+    "NZDT": "Pacific/Auckland",        # New Zealand Daylight Time
+    "FJT": "Pacific/Fiji",             # Fiji Time
+    "WST_WS": "Pacific/Apia",         # West Samoa Time
+    "PGT": "Pacific/Port_Moresby",     # Papua New Guinea Time
+    "SBT": "Pacific/Guadalcanal",      # Solomon Islands Time
+    "VUT": "Pacific/Efate",            # Vanuatu Time
+    "CHST": "Pacific/Guam",            # Chamorro Standard Time
+    "TLT_TL": "Pacific/Dili",          # East Timor Time
+    "MHT": "Pacific/Majuro",           # Marshall Islands Time
+    "CHST_MH": "Pacific/Majuro",       # Marshall Islands Time
+    "SST": "Pacific/Pago_Pago",        # Samoa Standard Time
+    "TKT": "Pacific/Fakaofo",          # Tokelau Time
+    "LINT": "Pacific/Kiritimati",      # Line Islands Time
+
+    # ──────────────────────────────────────────────
+    # ATLANTIC & SPECIAL
+    # ──────────────────────────────────────────────
+    "WAT_GI": "Europe/Gibraltar",      # Gibraltar Time
+    "CET_MC": "Europe/Monaco",         # Monaco Time
+    "CET_AD": "Europe/Andorra",        # Andorra Time
+    "CET_SM": "Europe/San_Marino",     # San Marino Time
+    "CET_VA": "Europe/Vatican",        # Vatican Time
+    "CET_LI": "Europe/Vaduz",          # Liechtenstein Time
+    "CET_LU": "Europe/Luxembourg",     # Luxembourg Time
+    "CET_BE": "Europe/Brussels",       # Belgium Time
+    "CET_CH": "Europe/Zurich",         # Switzerland Time
+    "WET_FO": "Atlantic/Faroe",        # Faroe Islands Time
+    "WET_IS": "Atlantic/Reykjavik",    # Iceland Time
+    "WET_GL": "America/Nuuk",          # Greenland Time
+    "MDT_MX": "America/Mazatlan",      # Mazatlan Time
+    "PST_BZ": "America/Belize",        # Belize Time
+    "WET_MA": "Africa/Casablanca",     # Morocco Time
+    "WET_DZ": "Africa/Algiers",        # Algeria Time
+    "EET_LY": "Africa/Tripoli",        # Libya Time
+    "EET_EG": "Africa/Cairo",          # Egypt Time
+    "EET_TN": "Africa/Tunis",          # Tunisia Time
+    "EET_SD": "Africa/Khartoum",       # Sudan Time
+    "EET_SS": "Africa/Juba",           # South Sudan Time
 }
+
 
 # ======================================================================
 # Public API
@@ -106,43 +344,44 @@ def convert_datetime(
 
     Args:
         datetime_string (str): The datetime string to parse. Can be in any
-            format supported by the `dateparser` library, such as:
-            - "2026-08-13 13:30:00"
-            - "August 13, 2026 1:30 PM"
-            - "13/08/2026 13:30"
-            - "Tomorrow at 10 AM"
-            - "2 hours ago"
-            - "13th August 2026 1:30 PM"
+            format supported by the ``dateparser`` library, such as:
+
+            - ``"2026-08-13 13:30:00"``
+            - ``"August 13, 2026 1:30 PM"``
+            - ``"13/08/2026 13:30"``
+            - ``"Tomorrow at 10 AM"``
+            - ``"2 hours ago"``
+            - ``"13th August 2026 1:30 PM"``
 
         parse_to (Optional[list[str]]): A list of timezone strings to convert
-            the parsed datetime into. Accepts both common aliases (e.g., "IST",
-            "PST") and full IANA timezone names (e.g., "Asia/Kolkata",
-            "America/New_York"). These conversions are only performed when
-            `parse_to_system` is False.
+            the parsed datetime into. Accepts both common aliases (e.g.,
+            ``"IST"``, ``"PST"``) and full IANA timezone names (e.g.,
+            ``"Asia/Kolkata"``, ``"America/New_York"``). These conversions
+            are only performed when ``parse_to_system`` is ``False``.
 
-        parse_to_system (bool): If True, converts the parsed datetime to the
-            system's local timezone and includes the timezone name in the
-            response. When True, `parse_to` conversions are skipped.
+        parse_to_system (bool): If ``True``, converts the parsed datetime to
+            the system's local timezone and includes the timezone name in the
+            response. When ``True``, ``parse_to`` conversions are skipped.
 
-        parse_to_utc (bool): If True, converts the parsed datetime to UTC and
-            includes both the ISO-formatted string and the Unix timestamp.
+        parse_to_utc (bool): If ``True``, converts the parsed datetime to UTC
+            and includes both the ISO-formatted string and the Unix timestamp.
 
     Returns:
         dict[str, Any]: A dictionary containing:
-            - "original_string" (str): The original datetime string passed.
-            - "is_parsed" (bool): Whether the string was successfully parsed.
-            - "parsed_datetime" (str | None): The datetime in ISO 8601 format.
-            - "parsed_timestamp" (int | None): The Unix timestamp of parsed dt.
-            - "utc" (str | None): UTC datetime in ISO 8601 format.
-            - "utc_timestamp" (int | None): Unix timestamp in UTC.
-            - "system" (str | None): System timezone datetime string.
-            - "system_timestamp" (int | None): Unix timestamp in system tz.
-            - "system_timezone" (str | None): Name of the system timezone.
-            - "custom_timezones" (dict): Converted datetime for each timezone
-              in `parse_to`, keyed by the timezone string.
-            - "error" (str | None): Error message if parsing failed.
-            - "utc_error" (str | None): Error message if UTC conversion failed.
-            - "system_error" (str | None): Error message if system tz failed.
+
+            - ``"original_string"`` (str): The original datetime string passed.
+            - ``"is_parsed"`` (bool): Whether the string was successfully parsed.
+            - ``"parsed_datetime"`` (str | None): The datetime in ISO 8601 format.
+            - ``"parsed_timestamp"`` (int | None): The Unix timestamp.
+            - ``"utc"`` (str | None): UTC datetime in ISO 8601 format.
+            - ``"utc_timestamp"`` (int | None): Unix timestamp in UTC.
+            - ``"system"`` (str | None): System timezone datetime string.
+            - ``"system_timestamp"`` (int | None): Unix timestamp in system tz.
+            - ``"system_timezone"`` (str | None): Name of the system timezone.
+            - ``"custom_timezones"`` (dict): Converted datetime for each tz.
+            - ``"error"`` (str | None): Error message if parsing failed.
+            - ``"utc_error"`` (str | None): Error if UTC conversion failed.
+            - ``"system_error"`` (str | None): Error if system tz failed.
 
     Raises:
         None. This function is designed to never raise exceptions. All errors
@@ -153,7 +392,7 @@ def convert_datetime(
 
         >>> result = convert_datetime(
         ...     datetime_string="August 13, 2026 1:30 PM",
-        ...     parse_to_utc=True
+        ...     parse_to_utc=True,
         ... )
         >>> print(result["utc"])
         "2026-08-13T08:00:00+0000"
@@ -164,7 +403,7 @@ def convert_datetime(
         ...     datetime_string="13/08/2026 13:30",
         ...     parse_to=["IST", "America/New_York"],
         ...     parse_to_system=True,
-        ...     parse_to_utc=True
+        ...     parse_to_utc=True,
         ... )
         >>> print(result)
         {
@@ -175,7 +414,6 @@ def convert_datetime(
             "utc": "2026-08-13T08:00:00+0000",
             "utc_timestamp": 1786645200,
             "system": "2026-08-13 01:30:00 PM IST",
-            "system_timestamp": 1786680000,
             "system_timezone": "Asia/Kolkata",
             "custom_timezones": {},
             "error": None,
@@ -188,7 +426,7 @@ def convert_datetime(
         >>> result = convert_datetime(
         ...     datetime_string="Tomorrow at 10 AM",
         ...     parse_to_system=True,
-        ...     parse_to_utc=True
+        ...     parse_to_utc=True,
         ... )
     """
 
@@ -252,16 +490,17 @@ def convert_datetime(
 
 def resolve_timezone(tz_string: str) -> ZoneInfo:
     """
-    Resolve a timezone string to a ZoneInfo object.
+    Resolve a timezone string to a ``ZoneInfo`` object.
 
-    This function accepts both common timezone aliases (e.g., "IST", "PST")
-    and full IANA timezone names (e.g., "Asia/Kolkata", "America/New_York").
+    This function accepts both common timezone aliases (e.g., ``"IST"``,
+    ``"PST"``) and full IANA timezone names (e.g., ``"Asia/Kolkata"``,
+    ``"America/New_York"``).
 
     Args:
         tz_string (str): The timezone string to resolve.
 
     Returns:
-        ZoneInfo: The corresponding ZoneInfo object.
+        ZoneInfo: The corresponding ``ZoneInfo`` object.
 
     Raises:
         ValueError: If the timezone string cannot be resolved.
@@ -283,7 +522,7 @@ def get_system_timezone() -> tuple[str, str]:
     Get the current system timezone name and its IANA equivalent.
 
     Returns:
-        tuple[str, str]: A tuple of (system_tz_name, iana_tz_string).
+        tuple[str, str]: A tuple of ``(system_tz_name, iana_tz_string)``.
 
     Examples:
         >>> name, iana = get_system_timezone()
@@ -300,7 +539,8 @@ def list_supported_timezones() -> list[dict[str, str]]:
     List all supported timezone aliases and their IANA equivalents.
 
     Returns:
-        list[dict[str, str]]: A list of dicts with 'alias' and 'iana' keys.
+        list[dict[str, str]]: A list of dicts with ``'alias'`` and
+        ``'iana'`` keys.
 
     Examples:
         >>> timezones = list_supported_timezones()
@@ -311,6 +551,31 @@ def list_supported_timezones() -> list[dict[str, str]]:
         EST -> America/New_York
     """
     return [{"alias": alias, "iana": iana} for alias, iana in TZ_ALIASES.items()]
+
+
+def get_all_aliases_for_iana(iana_name: str) -> list[str]:
+    """
+    Get all alias abbreviations that map to a given IANA timezone name.
+
+    This is useful for reverse lookups. For example, passing
+    ``"Asia/Kolkata"`` would return ``["IST"]``.
+
+    Args:
+        iana_name (str): The IANA timezone name to search for.
+
+    Returns:
+        list[str]: A list of alias strings that map to the given IANA name.
+
+    Examples:
+        >>> aliases = get_all_aliases_for_iana("Asia/Kolkata")
+        >>> print(aliases)
+        ["IST"]
+
+        >>> aliases = get_all_aliases_for_iana("America/New_York")
+        >>> print(aliases)
+        ["EST", "EDT"]
+    """
+    return [alias for alias, iana in TZ_ALIASES.items() if iana == iana_name]
 
 
 # ======================================================================
@@ -329,7 +594,7 @@ def _parse_input(
         response: The response dictionary to update on failure.
 
     Returns:
-        The parsed datetime object, or None if parsing failed.
+        The parsed datetime object, or ``None`` if parsing failed.
     """
     try:
         parsed_dt = dateparser_parse(datetime_string)
@@ -340,7 +605,9 @@ def _parse_input(
             logger.warning(response["error"])
             return None
         response["is_parsed"] = True
-        logger.debug(f"Successfully parsed: '{datetime_string}' -> {parsed_dt}")
+        logger.debug(
+            f"Successfully parsed: '{datetime_string}' -> {parsed_dt}"
+        )
         return parsed_dt
     except Exception as e:
         response["error"] = f"Parsing failed with exception: {str(e)}"
@@ -350,7 +617,11 @@ def _parse_input(
 
 def _attach_default_timezone(dt: datetime) -> datetime:
     """
-    Attach the default timezone (IST) to a naive datetime.
+    Attach the default timezone (``Asia/Kolkata``) to a naive datetime.
+
+    If ``dateparser`` returns a naive datetime (no timezone info), this
+    function attaches the default timezone to it. This ensures that all
+    subsequent conversions are accurate.
 
     Args:
         dt: The datetime object to attach timezone to.
@@ -360,7 +631,8 @@ def _attach_default_timezone(dt: datetime) -> datetime:
     """
     if dt.tzinfo is None:
         logger.debug(
-            f"Naive datetime detected, attaching default timezone: {DEFAULT_TIMEZONE}"
+            f"Naive datetime detected, attaching default timezone: "
+            f"{DEFAULT_TIMEZONE}"
         )
         return dt.replace(tzinfo=ZoneInfo(DEFAULT_TIMEZONE))
     return dt
@@ -399,9 +671,13 @@ def _convert_to_system(dt: datetime, response: dict[str, Any]) -> None:
         response["system"] = system_dt.strftime("%Y-%m-%d %I:%M:%S %p %Z")
         response["system_timestamp"] = int(system_dt.timestamp())
         response["system_timezone"] = system_tz_name
-        logger.debug(f"System conversion: {dt} -> {system_dt} ({system_tz_name})")
+        logger.debug(
+            f"System conversion: {dt} -> {system_dt} ({system_tz_name})"
+        )
     except Exception as e:
-        response["system_error"] = f"System timezone conversion failed: {str(e)}"
+        response["system_error"] = (
+            f"System timezone conversion failed: {str(e)}"
+        )
         logger.error(response["system_error"])
 
 
@@ -424,12 +700,16 @@ def _convert_to_custom(
             response["custom_timezones"][tz_string] = {
                 "timezone_name": tz_string,
                 "iana_name": str(resolved_tz),
-                "datetime": converted_dt.strftime("%Y-%m-%d %I:%M:%S %p %Z"),
+                "datetime": converted_dt.strftime(
+                    "%Y-%m-%d %I:%M:%S %p %Z"
+                ),
                 "timestamp": int(converted_dt.timestamp()),
                 "iso_format": converted_dt.isoformat(),
                 "error": None,
             }
-            logger.debug(f"Custom conversion: {dt} -> {converted_dt} ({tz_string})")
+            logger.debug(
+                f"Custom conversion: {dt} -> {converted_dt} ({tz_string})"
+            )
         except Exception as e:
             response["custom_timezones"][tz_string] = {
                 "timezone_name": tz_string,
@@ -437,23 +717,29 @@ def _convert_to_custom(
                 "datetime": None,
                 "timestamp": None,
                 "iso_format": None,
-                "error": f"Conversion failed for '{tz_string}': {str(e)}",
+                "error": (
+                    f"Conversion failed for '{tz_string}': {str(e)}"
+                ),
             }
-            logger.error(f"Custom conversion failed for '{tz_string}': {e}")
+            logger.error(
+                f"Custom conversion failed for '{tz_string}': {e}"
+            )
 
 
 def _resolve_timezone(tz_string: str) -> ZoneInfo:
     """
-    Resolve a timezone string to a ZoneInfo object.
+    Resolve a timezone string to a ``ZoneInfo`` object.
 
-    Handles both common aliases (e.g., 'IST', 'PST') and full IANA names
-    (e.g., 'Asia/Kolkata', 'America/New_York').
+    This function accepts both common aliases (e.g., ``'IST'``, ``'PST'``)
+    and full IANA timezone names (e.g., ``'Asia/Kolkata'``,
+    ``'America/New_York'``). Aliases are checked first (case-insensitive),
+    then direct IANA lookup is attempted.
 
     Args:
         tz_string: The timezone string to resolve.
 
     Returns:
-        The corresponding ZoneInfo object.
+        The corresponding ``ZoneInfo`` object.
 
     Raises:
         ValueError: If the timezone string cannot be resolved.
@@ -469,13 +755,10 @@ def _resolve_timezone(tz_string: str) -> ZoneInfo:
     except (ZoneInfoNotFoundError, KeyError):
         pass
 
-    # Step 3: Check if it's UTC (special case)
-    if upper_key == "UTC":
-        return ZoneInfo("UTC")
-
-    # Step 4: Raise error with helpful message
-    supported = ", ".join(sorted(TZ_ALIASES.keys()))
+    # Step 3: Raise error with helpful message
     raise ValueError(
-        f"Unknown timezone: '{tz_string}'. "
-        f"Use IANA names (e.g., 'Asia/Kolkata') or supported aliases: {supported}"
+        f"Invalid timezone: '{tz_string}'. "
+        f"Use IANA names (e.g., 'Asia/Kolkata') or supported aliases "
+        f"(e.g., 'IST', 'PST'). Run list_supported_timezones() to see "
+        f"all supported timezones."
     )
