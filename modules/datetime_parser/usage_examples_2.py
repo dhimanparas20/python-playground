@@ -1,4 +1,4 @@
-from datetime_parser import convert_datetime, list_supported_timezones
+from modules.datetime_parser import convert_datetime, list_supported_timezones
 
 # ─────────────────────────────────────────────
 # Example 1: Convert to UTC

@@ -3,11 +3,8 @@ Complete usage examples for the datetime_parser module.
 Run this file directly to see all examples in action.
 """
 
-from datetime_parser import (
-    convert_datetime,
+from modules.datetime_parser import (
     format_iso,
-    list_supported_timezones,
-    resolve_timezone,
     string_to_timestamp,
     timestamp_to_string,
 )
