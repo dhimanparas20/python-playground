@@ -107,6 +107,25 @@ class RedisHashUtil:
         if effective_ttl is not None:
             await self._async_client.expire(key, effective_ttl)
 
+    @staticmethod
+    def _serialize_data(data: Dict[str, Any]) -> Dict[str, str]:
+        """JSON-encode each value in the dict so Redis can store it faithfully."""
+        return {
+            k: json.dumps(v, ensure_ascii=False, default=str)
+            for k, v in data.items()
+        }
+
+    @staticmethod
+    def _deserialize_data(data: Dict[str, str]) -> Dict[str, Any]:
+        """JSON-decode each value to restore original Python types."""
+        result: Dict[str, Any] = {}
+        for k, v in data.items():
+            try:
+                result[k] = json.loads(v)
+            except (json.JSONDecodeError, TypeError):
+                result[k] = v
+        return result
+
     # ──────────────────────────────────────────────
     # SYNC CRUD OPERATIONS
     # ──────────────────────────────────────────────
@@ -141,11 +160,11 @@ class RedisHashUtil:
             raise ValueError(f"Entry '{key}' already exists. Use overwrite=True to update.")
         if overwrite:
             self._sync_client.delete(key)
-        self._sync_client.hset(key, mapping=data)
+        self._sync_client.hset(key, mapping=self._serialize_data(data))
         self._apply_ttl(key, ttl)
         return id
 
-    def read(self, id: str, field: Optional[str] = None) -> Optional[Union[str, Dict[str, str]]]:
+    def read(self, id: str, field: Optional[str] = None) -> Optional[Union[str, Dict[str, Union[str, bool]]]]:
         """
         Read hash entry or specific field.
 
@@ -158,8 +177,14 @@ class RedisHashUtil:
         """
         key = self._key(id)
         if field is not None:
-            return self._sync_client.hget(key, field)
-        data = self._sync_client.hgetall(key)
+            raw = self._sync_client.hget(key, field)
+            if raw is None:
+                return None
+            try:
+                return json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                return raw
+        data = self._deserialize_data(self._sync_client.hgetall(key))
         return data if data else None
 
     def update(self, id: str, data: Dict[str, Any], ttl: Optional[int] = None) -> bool:
@@ -177,7 +202,7 @@ class RedisHashUtil:
         key = self._key(id)
         if not self._sync_client.exists(key):
             return False
-        self._sync_client.hset(key, mapping=data)
+        self._sync_client.hset(key, mapping=self._serialize_data(data))
         self._apply_ttl(key, ttl)
         return True
 
@@ -253,7 +278,7 @@ class RedisHashUtil:
         Returns:
             True if field was set (did not exist), False if already present.
         """
-        return bool(self._sync_client.hsetnx(self._key(id), field, value))
+        return bool(self._sync_client.hsetnx(self._key(id), field, json.dumps(value, ensure_ascii=False, default=str)))
 
     def get_or_create(
         self,
@@ -273,10 +298,10 @@ class RedisHashUtil:
             The entry data (existing or newly created).
         """
         key = self._key(id)
-        existing = self._sync_client.hgetall(key)
+        existing = self._deserialize_data(self._sync_client.hgetall(key))
         if existing:
             return existing
-        self._sync_client.hset(key, mapping=data)
+        self._sync_client.hset(key, mapping=self._serialize_data(data))
         self._apply_ttl(key, ttl)
         return data
 
@@ -438,7 +463,7 @@ class RedisHashUtil:
     def search(
         self,
         field: str,
-        value: str,
+        value: Any,
         exact: bool = True,
         batch_size: int = 1000,
     ) -> List[str]:
@@ -468,9 +493,13 @@ class RedisHashUtil:
                 for key, val in zip(keys, results):
                     if val is None:
                         continue
-                    if exact and val == value:
+                    try:
+                        decoded = json.loads(val)
+                    except (json.JSONDecodeError, TypeError):
+                        decoded = val
+                    if exact and decoded == value:
                         matches.append(key.removeprefix(f"{self.prefix}:"))
-                    elif not exact and value in val:
+                    elif not exact and str(value) in str(decoded):
                         matches.append(key.removeprefix(f"{self.prefix}:"))
             if cursor == 0:
                 break
@@ -482,7 +511,7 @@ class RedisHashUtil:
         value: str,
         exact: bool = True,
         batch_size: int = 1000,
-    ) -> Dict[str, Dict[str, str]]:
+    ) -> Dict[str, Dict[str, Union[str, bool]]]:
         """
         Search entries with full data where a field matches a value.
 
@@ -527,7 +556,7 @@ class RedisHashUtil:
                 continue
             if overwrite:
                 pipe.delete(key)
-            pipe.hset(key, mapping=data)
+            pipe.hset(key, mapping=self._serialize_data(data))
             ids_map[id] = id
         pipe.execute()
         # Apply TTL after pipeline since EXPIRE needs keys to exist
@@ -540,13 +569,16 @@ class RedisHashUtil:
                 ttl_pipe.execute()
         return ids_map
 
-    def bulk_read(self, ids: List[str]) -> Dict[str, Optional[Dict[str, str]]]:
+    def bulk_read(self, ids: List[str]) -> Dict[str, Optional[Dict[str, Union[str, bool]]]]:
         """Read multiple hash entries using pipeline."""
         pipe = self._sync_client.pipeline(transaction=False)
         for id in ids:
             pipe.hgetall(self._key(id))
         results = pipe.execute()
-        return {id: (data if data else None) for id, data in zip(ids, results)}
+        return {
+            id: (self._deserialize_data(data) if data else None)
+            for id, data in zip(ids, results)
+        }
 
     def bulk_update(
         self,
@@ -568,7 +600,7 @@ class RedisHashUtil:
         for id, data in updates.items():
             key = self._key(id)
             if self._sync_client.exists(key):
-                pipe.hset(key, mapping=data)
+                pipe.hset(key, mapping=self._serialize_data(data))
                 count += 1
         pipe.execute()
         if count > 0:
@@ -593,13 +625,13 @@ class RedisHashUtil:
     def get_all(
         self,
         pattern: Optional[str] = None,
-        filter_by: Optional[Dict[str, str]] = None,
+        filter_by: Optional[Dict[str, Any]] = None,
         sort_by: Optional[str] = None,
         sort_order: str = "asc",
         offset: int = 0,
         limit: int = 0,
         batch_size: int = 1000,
-    ) -> Dict[str, Dict[str, str]]:
+    ) -> Dict[str, Dict[str, Union[str, bool]]]:
         """
         Get all hash entries under this prefix using SCAN with filtering,
         sorting, and pagination.
@@ -633,6 +665,7 @@ class RedisHashUtil:
                 for key, data in zip(keys, data_list):
                     id = key.removeprefix(f"{self.prefix}:")
                     if data:
+                        data = self._deserialize_data(data)
                         # Apply filter
                         if filter_by:
                             match = all(data.get(k) == v for k, v in filter_by.items())
@@ -747,7 +780,7 @@ class RedisHashUtil:
         idx_key = f"{self.prefix}:{self.index_key}:{field}:{value}"
         return list(self._sync_client.smembers(idx_key))
 
-    def find_by_index_with_data(self, field: str, value: str) -> Dict[str, Dict[str, str]]:
+    def find_by_index_with_data(self, field: str, value: str) -> Dict[str, Dict[str, Union[str, bool]]]:
         """Find entries with data by indexed field value."""
         ids = self.find_by_index(field, value)
         return self.bulk_read(ids)
@@ -1026,16 +1059,22 @@ class RedisHashUtil:
             raise ValueError(f"Entry '{key}' already exists. Use overwrite=True to update.")
         if overwrite:
             await self._async_client.delete(key)
-        await self._async_client.hset(key, mapping=data)
+        await self._async_client.hset(key, mapping=self._serialize_data(data))
         await self._apply_ttl_async(key, ttl)
         return id
 
-    async def async_read(self, id: str, field: Optional[str] = None) -> Optional[Union[str, Dict[str, str]]]:
+    async def async_read(self, id: str, field: Optional[str] = None) -> Optional[Union[str, Dict[str, Union[str, bool]]]]:
         """Async: Read hash entry or specific field."""
         key = self._key(id)
         if field is not None:
-            return await self._async_client.hget(key, field)
-        data = await self._async_client.hgetall(key)
+            raw = await self._async_client.hget(key, field)
+            if raw is None:
+                return None
+            try:
+                return json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                return raw
+        data = self._deserialize_data(await self._async_client.hgetall(key))
         return data if data else None
 
     async def async_update(self, id: str, data: Dict[str, Any], ttl: Optional[int] = None) -> bool:
@@ -1043,7 +1082,7 @@ class RedisHashUtil:
         key = self._key(id)
         if not await self._async_client.exists(key):
             return False
-        await self._async_client.hset(key, mapping=data)
+        await self._async_client.hset(key, mapping=self._serialize_data(data))
         await self._apply_ttl_async(key, ttl)
         return True
 
@@ -1053,20 +1092,20 @@ class RedisHashUtil:
 
     async def async_set_if_not_exists(self, id: str, field: str, value: Any) -> bool:
         """Async: Atomically set a hash field only if it does not already exist."""
-        return bool(await self._async_client.hsetnx(self._key(id), field, value))
+        return bool(await self._async_client.hsetnx(self._key(id), field, json.dumps(value, ensure_ascii=False, default=str)))
 
     async def async_get_or_create(
         self,
         id: str,
         data: Dict[str, Any],
         ttl: Optional[int] = None,
-    ) -> Dict[str, str]:
+    ) -> Dict[str, Union[str, bool]]:
         """Async: Return existing entry data, or create it and return new data."""
         key = self._key(id)
-        existing = await self._async_client.hgetall(key)
+        existing = self._deserialize_data(await self._async_client.hgetall(key))
         if existing:
             return existing
-        await self._async_client.hset(key, mapping=data)
+        await self._async_client.hset(key, mapping=self._serialize_data(data))
         await self._apply_ttl_async(key, ttl)
         return data
 
@@ -1093,7 +1132,7 @@ class RedisHashUtil:
                 continue
             if overwrite:
                 pipe.delete(key)
-            pipe.hset(key, mapping=data)
+            pipe.hset(key, mapping=self._serialize_data(data))
             ids_map[id] = id
         await pipe.execute()
         if ids_map:
@@ -1105,24 +1144,27 @@ class RedisHashUtil:
                 await ttl_pipe.execute()
         return ids_map
 
-    async def async_bulk_read(self, ids: List[str]) -> Dict[str, Optional[Dict[str, str]]]:
+    async def async_bulk_read(self, ids: List[str]) -> Dict[str, Optional[Dict[str, Union[str, bool]]]]:
         """Async: Read multiple hash entries using pipeline."""
         pipe = self._async_client.pipeline(transaction=False)
         for id in ids:
             pipe.hgetall(self._key(id))
         results = await pipe.execute()
-        return {id: (data if data else None) for id, data in zip(ids, results)}
+        return {
+            id: (self._deserialize_data(data) if data else None)
+            for id, data in zip(ids, results)
+        }
 
     async def async_get_all(
         self,
         pattern: Optional[str] = None,
-        filter_by: Optional[Dict[str, str]] = None,
+        filter_by: Optional[Dict[str, Any]] = None,
         sort_by: Optional[str] = None,
         sort_order: str = "asc",
         offset: int = 0,
         limit: int = 0,
         batch_size: int = 1000,
-    ) -> Dict[str, Dict[str, str]]:
+    ) -> Dict[str, Dict[str, Union[str, bool]]]:
         """Async: Get all hash entries under this prefix with filtering, sorting, pagination."""
         search = f"{self.prefix}:{pattern}*" if pattern else f"{self.prefix}:*"
         result: Dict[str, Dict[str, str]] = {}
@@ -1137,6 +1179,7 @@ class RedisHashUtil:
                 for key, data in zip(keys, data_list):
                     id = key.removeprefix(f"{self.prefix}:")
                     if data:
+                        data = self._deserialize_data(data)
                         if filter_by:
                             match = all(data.get(k) == v for k, v in filter_by.items())
                             if not match:
@@ -1567,6 +1610,66 @@ class RedisCacheManager:
         if with_ttl:
             return True, self._sync_client.ttl(key)
         return True
+
+    def increment(
+        self,
+        cache_key: str,
+        amount: Union[int, float] = 1,
+        ttl: Optional[int] = None,
+    ) -> Union[int, float]:
+        """
+        Non-atomic increment stored numeric value.
+
+        Fetches the current value (starting from 0 if absent), adds ``amount``,
+        and stores back. Since this is a GET + SET operation it is **not atomic**
+        — fine for approximate counters like page views or rate estimates.
+
+        Args:
+            cache_key: Cache key.
+            amount: Amount to increment by (int or float). Defaults to 1.
+            ttl: TTL in seconds. Overrides ``default_ttl`` if provided.
+
+        Returns:
+            The new value after increment.
+
+        Example:
+            >>> cache.increment("page_views:homepage")
+            1
+            >>> cache.increment("page_views:homepage", 5)
+            6
+            >>> cache.increment("balance:42", -10)
+            -4
+        """
+        current = self.retrieve(cache_key)
+        new_val = (current if current is not None else 0) + amount
+        self.upsert(cache_key, new_val, ttl=ttl)
+        return new_val
+
+    def decrement(
+        self,
+        cache_key: str,
+        amount: Union[int, float] = 1,
+        ttl: Optional[int] = None,
+    ) -> Union[int, float]:
+        """
+        Non-atomic decrement stored numeric value.
+
+        Convenience wrapper around ``increment`` with a negated amount.
+        Starts from 0 if key does not exist.
+
+        Args:
+            cache_key: Cache key.
+            amount: Amount to decrement by (int or float). Defaults to 1.
+            ttl: TTL in seconds. Overrides ``default_ttl`` if provided.
+
+        Returns:
+            The new value after decrement.
+
+        Example:
+            >>> cache.decrement("rate_limit:user:42")
+            -1
+        """
+        return self.increment(cache_key, -amount, ttl=ttl)
 
     def delete(self, *cache_keys: str) -> int:
         """
@@ -2336,6 +2439,27 @@ class RedisCacheManager:
         await self._async_client.set(key, serialized)
         await self._apply_ttl_async(key, ttl)
         return True
+
+    async def async_increment(
+        self,
+        cache_key: str,
+        amount: Union[int, float] = 1,
+        ttl: Optional[int] = None,
+    ) -> Union[int, float]:
+        """Async: Non-atomic increment stored numeric value."""
+        current = await self.async_retrieve(cache_key)
+        new_val = (current if current is not None else 0) + amount
+        await self.async_upsert(cache_key, new_val, ttl=ttl)
+        return new_val
+
+    async def async_decrement(
+        self,
+        cache_key: str,
+        amount: Union[int, float] = 1,
+        ttl: Optional[int] = None,
+    ) -> Union[int, float]:
+        """Async: Non-atomic decrement stored numeric value."""
+        return await self.async_increment(cache_key, -amount, ttl=ttl)
 
     async def async_delete(self, *cache_keys: str) -> int:
         """Async: Delete one or more cached entries."""
