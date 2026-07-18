@@ -1460,7 +1460,8 @@ class RedisCacheManager:
         value: Any,
         ttl: Optional[int] = None,
         overwrite: bool = False,
-    ) -> bool:
+        with_ttl: bool = False,
+    ) -> Union[bool, tuple[bool, int]]:
         """
         Store a value in the cache.
 
@@ -1474,9 +1475,10 @@ class RedisCacheManager:
             ttl: TTL in seconds. Overrides ``default_ttl`` if provided.
                  Use -1 for permanent entry.
             overwrite: If True, overwrite existing entries silently.
+            with_ttl: If True, return ``(bool, seconds_to_live)`` instead of bool.
 
         Returns:
-            True if the value was stored.
+            True if the value was stored, or ``(True, ttl)`` if ``with_ttl=True``.
 
         Raises:
             ValueError: If key exists and ``overwrite=False``.
@@ -1495,11 +1497,13 @@ class RedisCacheManager:
         serialized = self._serialize(value)
         self._sync_client.set(key, serialized)
         self._apply_ttl(key, ttl)
+        if with_ttl:
+            return True, self._sync_client.ttl(key)
         return True
 
     def retrieve(
-        self, cache_key: str, default: Any = None
-    ) -> Any:
+        self, cache_key: str, default: Any = None, with_ttl: bool = False
+    ) -> Union[Any, tuple[Any, int]]:
         """
         Retrieve a cached value by key.
 
@@ -1509,9 +1513,11 @@ class RedisCacheManager:
         Args:
             cache_key: Cache key to look up.
             default: Value to return if key is missing. Defaults to None.
+            with_ttl: If True, return ``(value, seconds_to_live)`` instead of value.
 
         Returns:
             The cached value (deserialized), or ``default`` if not found.
+            If ``with_ttl=True``, returns ``(value, ttl)`` or ``(default, -2)``.
 
         Example:
             >>> cache.retrieve("session:abc")
@@ -1522,15 +1528,19 @@ class RedisCacheManager:
         key = self._key(cache_key)
         raw = self._sync_client.get(key)
         if raw is None:
-            return default
-        return self._deserialize(raw)
+            return (default, -2) if with_ttl else default
+        value = self._deserialize(raw)
+        if with_ttl:
+            return value, self._sync_client.ttl(key)
+        return value
 
     def upsert(
         self,
         cache_key: str,
         value: Any,
         ttl: Optional[int] = None,
-    ) -> bool:
+        with_ttl: bool = False,
+    ) -> Union[bool, tuple[bool, int]]:
         """
         Store or update a cached value (create-or-update semantics).
 
@@ -1541,9 +1551,10 @@ class RedisCacheManager:
             cache_key: Cache key.
             value: Value to cache.
             ttl: TTL in seconds. Overrides ``default_ttl`` if provided.
+            with_ttl: If True, return ``(bool, seconds_to_live)`` instead of bool.
 
         Returns:
-            True if the value was stored.
+            True if the value was stored, or ``(True, ttl)`` if ``with_ttl=True``.
 
         Example:
             >>> cache.upsert("config:theme", "dark")
@@ -1553,6 +1564,8 @@ class RedisCacheManager:
         serialized = self._serialize(value)
         self._sync_client.set(key, serialized)
         self._apply_ttl(key, ttl)
+        if with_ttl:
+            return True, self._sync_client.ttl(key)
         return True
 
     def delete(self, *cache_keys: str) -> int:
@@ -1574,9 +1587,13 @@ class RedisCacheManager:
         full_keys = [self._key(k) for k in cache_keys]
         return int(self._sync_client.delete(*full_keys))
 
-    def exists(self, cache_key: str) -> bool:
+    def exists(self, cache_key: str, with_ttl: bool = False) -> Union[bool, tuple[bool, int]]:
         """Check if a cache key exists."""
-        return bool(self._sync_client.exists(self._key(cache_key)))
+        key = self._key(cache_key)
+        exists = self._sync_client.exists(key)
+        if with_ttl:
+            return bool(exists), self._sync_client.ttl(key) if exists else -2
+        return bool(exists)
 
     # ──────────────────────────────────────────────
     # ATOMIC / CACHE-ASIDE OPERATIONS
@@ -1587,7 +1604,8 @@ class RedisCacheManager:
         cache_key: str,
         value: Any,
         ttl: Optional[int] = None,
-    ) -> bool:
+        with_ttl: bool = False,
+    ) -> Union[bool, tuple[bool, int]]:
         """
         Store a value only if the key does not already exist (atomic).
 
@@ -1598,9 +1616,12 @@ class RedisCacheManager:
             cache_key: Cache key.
             value: Value to store.
             ttl: TTL in seconds. Overrides ``default_ttl`` if provided.
+            with_ttl: If True, return ``(bool, seconds_to_live)`` instead of bool.
 
         Returns:
             True if the value was set (key did not exist), False otherwise.
+            If ``with_ttl=True``, returns ``(True, ttl)`` on success,
+            ``(False, remaining_ttl)`` if key already exists.
 
         Example:
             >>> cache.store_if_not_exists("lock:job:123", "worker-1")
@@ -1615,6 +1636,8 @@ class RedisCacheManager:
             result = self._sync_client.set(key, serialized, nx=True, ex=effective_ttl)
         else:
             result = self._sync_client.set(key, serialized, nx=True)
+        if with_ttl:
+            return bool(result), self._sync_client.ttl(key)
         return bool(result)
 
     def get_or_set(
@@ -1622,7 +1645,8 @@ class RedisCacheManager:
         cache_key: str,
         factory: Union[Callable[[], Any], Any],
         ttl: Optional[int] = None,
-    ) -> Any:
+        with_ttl: bool = False,
+    ) -> Union[Any, tuple[Any, int]]:
         """
         Cache-aside (lazy-loading) pattern: retrieve existing value, or compute
         and cache a new one.
@@ -1637,9 +1661,11 @@ class RedisCacheManager:
                      static value to store on miss.
             ttl: TTL in seconds for the new entry. Overrides ``default_ttl``
                  if provided.
+            with_ttl: If True, return ``(value, seconds_to_live)`` instead of value.
 
         Returns:
             The cached or freshly computed value.
+            If ``with_ttl=True``, returns ``(value, ttl)``.
 
         Example:
             >>> # With a factory function (lazy computation)
@@ -1650,23 +1676,32 @@ class RedisCacheManager:
             >>> cache.get_or_set("config:feature_x", {"enabled": True})
             {"enabled": True}
         """
-        existing = self.retrieve(cache_key)
-        if existing is not None:
-            return existing
+        key = self._key(cache_key)
+        raw = self._sync_client.get(key)
+        if raw is not None:
+            value = self._deserialize(raw)
+            if with_ttl:
+                return value, self._sync_client.ttl(key)
+            return value
         value = factory() if callable(factory) else factory
         self.upsert(cache_key, value, ttl=ttl)
+        if with_ttl:
+            return value, self._sync_client.ttl(key)
         return value
 
     # ──────────────────────────────────────────────
     # TTL OPERATIONS
     # ──────────────────────────────────────────────
 
-    def expire(self, cache_key: str, seconds: int) -> bool:
+    def expire(
+        self, cache_key: str, seconds: int, with_ttl: bool = False
+    ) -> Union[bool, tuple[bool, int]]:
         """
         Set TTL on an existing cache entry.
 
         Args:
             cache_key: Cache key.
+            with_ttl: If True, return ``(bool, seconds_to_live)`` instead of bool.
             seconds: TTL in seconds.
 
         Returns:
@@ -1676,7 +1711,11 @@ class RedisCacheManager:
             >>> cache.expire("session:abc", 7200)
             True
         """
-        return bool(self._sync_client.expire(self._key(cache_key), seconds))
+        result = bool(self._sync_client.expire(self._key(cache_key), seconds))
+        if with_ttl:
+            key = self._key(cache_key)
+            return result, self._sync_client.ttl(key) if result else -2
+        return result
 
     def bulk_expire(self, cache_keys: List[str], seconds: int) -> int:
         """
@@ -1717,21 +1756,28 @@ class RedisCacheManager:
         """
         return self._sync_client.ttl(self._key(cache_key))
 
-    def persist(self, cache_key: str) -> bool:
+    def persist(
+        self, cache_key: str, with_ttl: bool = False
+    ) -> Union[bool, tuple[bool, int]]:
         """
         Remove TTL from a cache entry (make it permanent).
 
         Args:
             cache_key: Cache key.
+            with_ttl: If True, return ``(bool, seconds_to_live)`` instead of bool.
 
         Returns:
             True if TTL was removed, False otherwise.
+            If ``with_ttl=True``, returns ``(True, -1)`` on success.
 
         Example:
             >>> cache.persist("config:feature_x")
             True
         """
-        return bool(self._sync_client.persist(self._key(cache_key)))
+        result = bool(self._sync_client.persist(self._key(cache_key)))
+        if with_ttl:
+            return result, self._sync_client.ttl(self._key(cache_key))
+        return result
 
     # ──────────────────────────────────────────────
     # BULK OPERATIONS
