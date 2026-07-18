@@ -1,0 +1,22 @@
+[project]
+name = "python-playground"
+version = "0.1.0"
+description = "Universal playground with all module dependencies"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "bcrypt>=4.1.0",
+    "boto3>=1.34.0",
+    "botocore>=1.34.0",
+    "colorlog>=6.8.2",
+    "cryptography>=42.0.5",
+    "dateparser>=1.2.0",
+    "faker>=25.0.0",
+    "passlib>=1.7.4",
+    "pika>=1.3.2",
+    "pymongo>=4.10.0",
+    "python-dotenv>=1.0.1",
+    "redis>=5.0.0",
+    "requests>=2.32.0",
+    "tqdm>=4.66.2",
+]

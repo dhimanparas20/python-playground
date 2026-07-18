@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from faker import Faker
-from func_perf import timeit, timeit_stats  # assuming your decorators are in func_perf.py
+from modules.function_timer_decorator import timeit,timeit_stats
 
 
 def make_fake_people(n: int, *, locale: str = "en_US", seed: int | None = None):

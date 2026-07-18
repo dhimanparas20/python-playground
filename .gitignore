@@ -10,5 +10,4 @@ wheels/
 .venv
 .idea
 .vscode
-uv.lock
-pyproject.toml
+.env
