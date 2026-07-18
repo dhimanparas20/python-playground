@@ -15,6 +15,73 @@ uv sync          # install all dependencies
 python main.py   # prints "Hello from python-playground!"
 ```
 
+### Interactive Practice with IPython
+
+```bash
+uv run ipython
+```
+
+Opens an interactive IPython shell with all dependencies loaded. Import any module and start practicing:
+
+```python
+In [1]: from modules.logger import get_logger
+In [2]: log = get_logger("test")
+In [3]: log.success("it works!")   # custom SUCCESS level
+In [4]: log.info("hello %s", "world")
+
+In [5]: from faker import Faker
+In [6]: fake = Faker()
+In [7]: fake.name(), fake.email()
+
+In [8]: from modules.datetime_parser import convert_datetime, timestamp_to_string
+In [9]: convert_datetime("2024-01-01", from_tz="UTC", to_tz="Asia/Kolkata")
+
+In [10]: from modules.Redis.redis_core_util import RedisHashUtil
+In [11]: rh = RedisHashUtil()
+In [12]: rh.set_hash("myhash", {"name": "test", "value": 123})
+
+In [13]: from modules.MongoDB.mongo_util import MongoUtil
+In [14]: mu = MongoUtil()
+In [15]: mu.create("users", {"name": "Alice", "email": "alice@example.com"})
+
+In [16]: from modules.s3.s3_util import S3Util
+In [17]: s3 = S3Util()
+In [18]: s3.list_files("my-bucket")
+
+In [19]: from modules.EMXQ_MQTT import EMQXClient
+In [20]: client = EMQXClient()
+In [21]: client.get_status()
+
+In [22]: from modules.RabbitMQQueue_play import RabbitMQQueue
+In [23]: q = RabbitMQQueue("my_queue")
+In [24]: q.produce({"key": "value"})
+
+In [25]: from modules.function_timer_decorator import timeit
+In [26]: @timeit
+    ...: def slow_add(a, b):
+    ...:     import time; time.sleep(1)
+    ...:     return a + b
+In [27]: slow_add(1, 2)
+
+In [28]: from encrypt_and_decrypt_data import hash_password, validate_password
+In [29]: h = hash_password("mysecret123")
+In [30]: validate_password("mysecret123", h)
+
+In [31]: from faker_fake_data import make_fake_people
+In [32]: df = make_fake_people(5)    # returns DataFrame
+
+In [33]: import multiprocessing_and_multiprocessing.learn_threding as lt
+In [34]: lt.main()                   # run threading demo
+
+In [35]: import multiprocessing_and_multiprocessing.cpu_bound_comp as cpu
+In [36]: cpu.main()                  # run CPU-bound comparison
+
+In [37]: from code_practice.map_func import process_students
+In [38]: process_students()          # run map/filter/lambda demo
+```
+
+Tab-completion and `?` work too — e.g. `MongoUtil?` shows full docstring.
+
 ---
 
 ## Directory Structure
