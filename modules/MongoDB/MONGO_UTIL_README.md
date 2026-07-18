@@ -1,6 +1,6 @@
 # MongoUtil — Production-Ready MongoDB Utility
 
-A comprehensive, all-in-one Python utility class for MongoDB CRUD operations. Eliminates repetitive collection boilerplate by providing a clean interface for CRUD, bulk operations, TTL, native indexing, search, import/export, secure data hashing, and database/collection switching.
+A comprehensive, all-in-one Python utility class for MongoDB CRUD operations. Eliminates repetitive collection boilerplate by providing a clean interface for CRUD, bulk operations, TTL, native indexing, search, import/export, duplicate removal, secure data hashing, and database/collection switching.
 
 ## Why Use This?
 
@@ -65,7 +65,7 @@ cache = MongoUtil(database="myapp", collection="cache", default_ttl=600)  # 10 m
 ### CRUD Operations
 
 ```python
-# Create (auto-generates ObjectId if no id)
+# Create (auto-generates id as string)
 user_id = users.create({"username": "johndoe", "email": "john@example.com"})
 # returns: "68271a3f2e8b4c1234567890"
 
@@ -111,18 +111,20 @@ data = users.get_or_create("u-001", {"username": "alice", "status": "pending"})
 ### Bulk Operations
 
 ```python
-# Bulk create with explicit ids
+# Bulk create with explicit ids (returns dict)
 entries = {
     "u-001": {"name": "Alice", "role": "admin"},
     "u-002": {"name": "Bob", "role": "user"},
 }
-created_ids = users.bulk_create(entries, overwrite=True)
+created = users.bulk_create(entries, overwrite=True)
+# {'u-001': 'u-001', 'u-002': 'u-002'}
 
-# Bulk create with auto-generated ObjectIds (list input)
+# Bulk create with list input (returns list of ids)
 users.bulk_create([
     {"name": "Alice", "role": "admin"},
     {"name": "Bob", "role": "user"},
 ])
+# ['68271a3f...', '68271a3f...']
 
 # Bulk read
 data = users.bulk_read(["u-001", "u-002", "u-003"])
@@ -143,7 +145,7 @@ all_data = users.get_all()
 # With MongoDB query filter
 active_users = users.get_all(query={"status": "active", "age": {"$gte": 18}})
 
-# With sorting
+# With sorting (sort_order: Literal[1, -1] — only 1 or -1 accepted)
 sorted_users = users.get_all(sort_by="username", sort_order=1)    # 1=ASC, -1=DESC
 
 # With pagination
@@ -186,7 +188,7 @@ users.bulk_copy({"u-001": "u-001-v2", "u-002": "u-002-v2"})
 users.rename("u-001", "u-001-renamed")
 ```
 
-### TTL Operations (opt-in via `default_ttl`)
+### TTL Operations
 
 ```python
 # TTL is automatic when default_ttl is set
@@ -200,6 +202,11 @@ otps.bulk_expire(["otp-001", "otp-002"], 600)
 
 # Remove TTL (make permanent)
 otps.persist("otp-001")          # removes _createdAt field
+
+# expire() also works without default_ttl — creates a TTL index on-the-fly
+cache = MongoUtil(database="myapp", collection="temp_cache")
+cache.create({"key": "session_token"}, id="s-001")
+cache.expire("s-001", 60)  # deletes in 60 seconds, no default_ttl needed
 ```
 
 ### Search
@@ -266,15 +273,46 @@ dbs = MongoUtil.list_databases("mongodb://localhost:27017")
 # Count databases
 db_count = MongoUtil.count_databases("mongodb://localhost:27017")
 
-# List collections in current database
+# List collections (optional database name — defaults to current)
 collections = users.list_collections()
 # ['users', 'sessions', 'otps', 'logs']
+collections_in_other = users.list_collections(database="otherdb")
 
-# Count collections
+# Count collections (optional database name)
 col_count = users.count_collections()
 
-# Count documents in current collection
+# Count documents (optional database and/or collection name)
 doc_count = users.count_documents_in_collection()
+doc_count_other = users.count_documents_in_collection(database="logs", collection="audit")
+
+# Drop collection (irreversible)
+users.drop_collection()                    # drops current collection
+users.drop_collection("temp_data")         # drops a specific collection
+
+# Drop database (irreversible — all collections, indexes, documents removed)
+users.drop_database()                      # drops current database
+users.drop_database("staging_backup")      # drops a specific database
+```
+
+### Remove Duplicates
+
+```python
+# Duplicates based on specific fields — same email = duplicate
+result = users.remove_duplicates(query={"email": 1})
+# {'duplicate_groups': 3, 'total_duplicates': 8, 'to_delete': 5, 'deleted': 5, 'kept': 3}
+
+# Same email AND same name = duplicate
+users.remove_duplicates(query={"email": 1, "name": 1})
+
+# All fields identical = duplicate (pass empty query or None)
+users.remove_duplicates(query={})
+
+# Keep the last occurrence instead of first
+users.remove_duplicates(query={"email": 1}, keep="last")
+
+# Dry run — inspect before deleting
+report = users.remove_duplicates(query={"email": 1}, dry_run=True)
+print(report)  # shows duplicate_groups, to_delete without deleting
 ```
 
 ### Import / Export
@@ -558,10 +596,12 @@ def get_user(user_id: str):
 - `bulk_create` uses `insert_many` / `bulk_write` — **no N+1 queries**
 - `get_all` uses MongoDB's native `find()` with `skip()`, `limit()`, `sort()` — **server-side pagination**
 - `default_ttl` is opt-in — adds `_createdAt` field + TTL index only when configured
+- `expire()` works even without `default_ttl` — creates a TTL index on-the-fly
+- `remove_duplicates()` uses aggregation pipelines (specific fields) or Python comparison (all fields) — supports `dry_run` for safe inspection
 - Indexes are **native MongoDB indexes** (no separate collection hack)
 - Password hashing uses **bcrypt** with 12 rounds
 - Random generation uses **`secrets`** module (cryptographically secure)
 - Switch methods return **new instances** — no shared state mutation
 - All methods have full **type hints** and **docstrings**
 - Context manager ensures connections are closed properly
-- `create()` without `id` lets **MongoDB generate ObjectIds** natively
+- `create()` without `id` generates a string `_id` — always consistent with read/update/delete lookups

@@ -15,9 +15,10 @@ import string
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 try:
+    from bson.objectid import ObjectId
     from pymongo import MongoClient
     from pymongo.collection import Collection
     from pymongo.database import Database
@@ -138,8 +139,10 @@ class MongoUtil:
                 self._col.insert_one({**data, "_id": id})
             return id
         else:
-            result = self._col.insert_one(data)
-            return str(result.inserted_id)
+            auto_id = str(ObjectId())
+            data["_id"] = auto_id
+            self._col.insert_one(data)
+            return auto_id
 
     def read(
         self,
@@ -356,27 +359,38 @@ class MongoUtil:
     # TTL OPERATIONS
     # ──────────────────────────────────────────────
 
+    def _resolve_ttl(self, seconds: int) -> int:
+        """
+        Resolve the effective TTL index seconds to use for _createdAt adjustment.
+        When default_ttl is set, uses it. Otherwise looks up or creates a TTL index.
+        """
+        if self.default_ttl is not None:
+            return self.default_ttl
+        ttl_index_name = f"{self.index_key}_createdAt_ttl"
+        existing = self._col.index_information()
+        for name, info in existing.items():
+            if info.get("key") == [("_createdAt", 1)] and "expireAfterSeconds" in info:
+                return info["expireAfterSeconds"]
+        self._col.create_index(
+            "_createdAt",
+            name=ttl_index_name,
+            expireAfterSeconds=seconds,
+        )
+        return seconds
+
     def expire(self, id: str, seconds: int) -> bool:
         """
         Set/reset TTL on a document by updating its _createdAt.
-        Only works when default_ttl is configured.
 
         Args:
             id: Unique identifier for the document.
             seconds: Desired remaining TTL in seconds.
 
         Returns:
-            True if updated, False if document not found or no default_ttl.
-
-        Note:
-            MongoDB TTL indexes check the _createdAt field.
-            To set a document to expire in N seconds, we set
-            _createdAt = now - (default_ttl - seconds).
+            True if updated, False if document not found.
         """
-        if self.default_ttl is None:
-            return False
-        self._ensure_ttl_index()
-        delta = self.default_ttl - seconds
+        index_ttl = self._resolve_ttl(seconds)
+        delta = index_ttl - seconds
         new_time = datetime.now(timezone.utc) - timedelta(seconds=delta)
         result = self._col.update_one(
             {"_id": id},
@@ -395,10 +409,10 @@ class MongoUtil:
         Returns:
             Number of documents updated.
         """
-        if not ids or self.default_ttl is None:
+        if not ids:
             return 0
-        self._ensure_ttl_index()
-        delta = self.default_ttl - seconds
+        index_ttl = self._resolve_ttl(seconds)
+        delta = index_ttl - seconds
         new_time = datetime.now(timezone.utc) - timedelta(seconds=delta)
         result = self._col.update_many(
             {"_id": {"$in": ids}},
@@ -612,7 +626,7 @@ class MongoUtil:
         self,
         entries: Union[Dict[str, Dict[str, Any]], List[Dict[str, Any]]],
         overwrite: bool = False,
-    ) -> Dict[str, str]:
+    ) -> Union[Dict[str, str], List[str]]:
         """
         Create multiple documents. Supports both dict (with ids) and list (auto-id) input.
 
@@ -621,18 +635,22 @@ class MongoUtil:
             overwrite: If True, replace existing documents.
 
         Returns:
-            Dict mapping generated/provided ids to themselves.
+            List of generated ids if list input, Dict mapping ids to themselves if dict input.
         """
         if not entries:
-            return {}
-        ids_map: Dict[str, str] = {}
+            return [] if isinstance(entries, list) else {}
         if isinstance(entries, list):
-            docs = [self._add_timestamp(dict(d)) for d in entries]
-            result = self._col.insert_many(docs, ordered=False)
-            for inserted_id in result.inserted_ids:
-                sid = str(inserted_id)
-                ids_map[sid] = sid
-            return ids_map
+            docs = []
+            ids: List[str] = []
+            for d in entries:
+                data = self._add_timestamp(dict(d))
+                doc_id = str(ObjectId())
+                data["_id"] = doc_id
+                docs.append(data)
+                ids.append(doc_id)
+            self._col.insert_many(docs, ordered=False)
+            return ids
+        ids_map: Dict[str, str] = {}
         if overwrite:
             from pymongo import ReplaceOne
             ops = []
@@ -713,7 +731,7 @@ class MongoUtil:
         self,
         query: Optional[Dict[str, Any]] = None,
         sort_by: Optional[str] = None,
-        sort_order: int = ASCENDING,
+        sort_order: Literal[1, -1] = ASCENDING,
         skip: int = 0,
         limit: int = 0,
     ) -> Dict[str, Dict[str, Any]]:
@@ -913,32 +931,137 @@ class MongoUtil:
         """
         return len(MongoUtil.list_databases(connection_string))
 
-    def list_collections(self) -> List[str]:
+    def list_collections(self, database: Optional[str] = None) -> List[str]:
         """
-        List all collections in the current database.
+        List all collections in a database.
+
+        Args:
+            database: Database name. If None, uses the current database.
 
         Returns:
             List of collection names.
         """
-        return self._db.list_collection_names()
+        db = self._client[database] if database else self._db
+        return db.list_collection_names()
 
-    def count_collections(self) -> int:
+    def count_collections(self, database: Optional[str] = None) -> int:
         """
-        Count all collections in the current database.
+        Count all collections in a database.
+
+        Args:
+            database: Database name. If None, uses the current database.
 
         Returns:
             Number of collections.
         """
-        return len(self._db.list_collection_names())
+        return len(self.list_collections(database=database))
 
-    def count_documents_in_collection(self) -> int:
+    def count_documents_in_collection(
+        self,
+        database: Optional[str] = None,
+        collection: Optional[str] = None,
+    ) -> int:
         """
-        Count all documents in the current collection.
+        Count all documents in a collection.
+
+        Args:
+            database: Database name. If None, uses the current database.
+            collection: Collection name. If None, uses the current collection.
 
         Returns:
             Number of documents.
         """
+        if database or collection:
+            db_name = database or self.database
+            col_name = collection or self.collection
+            return self._client[db_name][col_name].estimated_document_count()
         return self._col.estimated_document_count()
+
+    def drop_collection(self, collection: Optional[str] = None) -> None:
+        """
+        Drop a collection. Irreversible — all documents and indexes are removed.
+
+        Args:
+            collection: Collection name to drop. If None, drops the current collection.
+        """
+        col_name = collection or self.collection
+        self._db.drop_collection(col_name)
+
+    def drop_database(self, database: Optional[str] = None) -> None:
+        """
+        Drop a database. Irreversible — all collections and documents are removed.
+
+        Args:
+            database: Database name to drop. If None, drops the current database.
+        """
+        db_name = database or self.database
+        self._client.drop_database(db_name)
+
+    def remove_duplicates(
+        self,
+        query: Optional[Dict[str, Any]] = None,
+        keep: Literal["first", "last"] = "first",
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Remove duplicate documents based on matching field values.
+
+        Args:
+            query: Dict of fields to compare for duplicates.
+                   {} or None means all fields (excluding _id)
+                   must match to be considered duplicates.
+                   e.g., {"email": 1} groups by the email field.
+                   e.g., {"email": 1, "name": 1} groups by email + name.
+            keep: Which duplicate to keep — "first" (earliest _id) or "last" (latest).
+            dry_run: If True, only report duplicates without deleting.
+
+        Returns:
+            Dict with duplicate_groups, total_duplicates, to_delete, deleted, kept.
+        """
+        to_delete: List[Any] = []
+        groups = 0
+        total_dups = 0
+
+        if query:
+            group_id = {f: f"${f}" for f in query}
+            pipeline = [
+                {"$group": {"_id": group_id, "ids": {"$push": "$_id"}, "count": {"$sum": 1}}},
+                {"$match": {"count": {"$gt": 1}}},
+            ]
+            for group in self._col.aggregate(pipeline):
+                groups += 1
+                ids = group["ids"]
+                total_dups += len(ids)
+                ids.sort(key=lambda x: ObjectId(x).generation_time if isinstance(x, str) and len(x) == 24 else 0)
+                to_delete.extend(ids[1:] if keep == "first" else ids[:-1])
+        else:
+            docs = list(self._col.find().sort("_id", 1 if keep == "first" else -1))
+            seen: List[Any] = []
+            for doc in docs:
+                doc_id = doc.pop("_id", None)
+                content = sorted((k, v) for k, v in doc.items())
+                if content in seen:
+                    to_delete.append(doc_id)
+                    total_dups += 1
+                else:
+                    seen.append(content)
+                    groups += 1
+            total_dups += groups
+
+        result: Dict[str, Any] = {
+            "duplicate_groups": groups,
+            "total_duplicates": total_dups,
+            "to_delete": len(to_delete),
+            "kept": groups,
+        }
+
+        if dry_run or not to_delete:
+            result["deleted"] = 0
+            return result
+
+        delete_result = self._col.delete_many({"_id": {"$in": to_delete}})
+        result["deleted"] = delete_result.deleted_count
+        return result
 
     # ──────────────────────────────────────────────
     # IMPORT / EXPORT — JSON
@@ -1671,6 +1794,39 @@ if __name__ == "__main__":
     print(f"OTP entries: {otps.count_all()}")
     print("(These will auto-delete after 5 minutes via MongoDB TTL index)")
 
+    # expire without default_ttl
+    temp = MongoUtil(database="myapp", collection="temp_cache")
+    temp.delete_all()
+    temp.create({"key": "temp_data"}, id="temp_001")
+    temp.expire("temp_001", 10)
+    print(f"Temp doc — will expire ~10s: {temp.read('temp_001') is not None}")
+
+    # ── REMOVE DUPLICATES ────────────────────
+
+    print("\n--- Remove Duplicates ---")
+    dedup_test = MongoUtil(database="myapp", collection="dedup_test")
+    dedup_test.delete_all()
+    dedup_test.create({"email": "a@x.com", "name": "Alice"}, id="d1")
+    dedup_test.create({"email": "a@x.com", "name": "Alice"}, id="d2")   # duplicate
+    dedup_test.create({"email": "b@x.com", "name": "Bob"},   id="d3")
+    dedup_test.create({"email": "b@x.com", "name": "Bob"},   id="d4")   # duplicate
+    dedup_test.create({"email": "b@x.com", "name": "Bob"},   id="d5")   # duplicate
+    dedup_test.create({"email": "c@x.com", "name": "Charlie"}, id="d6")
+    print(f"Before dedup: {dedup_test.count_all()} docs")
+
+    report = dedup_test.remove_duplicates(query={"email": 1}, dry_run=True)
+    print(f"Dry run report: {report}")
+
+    report = dedup_test.remove_duplicates(query={"email": 1})
+    print(f"After dedup: {report}")
+    print(f"Final count: {dedup_test.count_all()} docs")
+
+    # ── DROP COLLECTION / DATABASE ───────────
+
+    print("\n--- Drop Operations ---")
+    print(f"Collections before drop: {users.list_collections()}")
+    print("(drop_collection / drop_database available but skipped in demo to preserve data)")
+
     # ── CLEANUP ───────────────────────────────
 
     print("\n--- Cleanup ---")
@@ -1679,6 +1835,8 @@ if __name__ == "__main__":
     users_csv_import.delete_all()
     otps.delete_all()
     sessions.delete_all()
+    temp.delete_all()
+    dedup_test.delete_all()
     print(f"Users remaining:        {users.count_all()}")
     print(f"Imported remaining:     {users_import.count_all()}")
     print(f"CSV Imported remaining: {users_csv_import.count_all()}")
@@ -1688,4 +1846,6 @@ if __name__ == "__main__":
     users_csv_import.close()
     otps.close()
     sessions.close()
+    temp.close()
+    dedup_test.close()
     print("\nDone!")
