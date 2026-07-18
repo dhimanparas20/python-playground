@@ -533,41 +533,48 @@ class RedisHashUtil:
 
     def bulk_create(
         self,
-        entries: Dict[str, Dict[str, Any]],
+        entries: Union[Dict[str, Dict[str, Any]], List[Dict[str, Any]]],
         overwrite: bool = False,
         ttl: Optional[int] = None,
-    ) -> Dict[str, str]:
+    ) -> Union[Dict[str, str], List[str]]:
         """
         Create multiple hash entries using pipeline.
 
+        Accepts either a dict of ``{id: data, ...}`` or a list of data dicts
+        (UUIDs auto-generated for each).
+
         Args:
-            entries: Dict mapping ids to their data dicts.
+            entries: Dict mapping ids to data dicts, or a list of data dicts.
             overwrite: If True, overwrite existing entries.
-            ttl: TTL in seconds. Overrides default_ttl if provided.
+            ttl: TTL in seconds. Overrides ``default_ttl`` if provided.
 
         Returns:
-            Dict mapping original ids to themselves (for API consistency).
+            Dict of ``{id: id, ...}`` if a dict was passed,
+            list of ids if a list was passed.
         """
-        ids_map: Dict[str, str] = {}
         pipe = self._sync_client.pipeline(transaction=False)
-        for id, data in entries.items():
+        items: List[tuple[str, Dict[str, Any]]] = (
+            list(entries.items()) if isinstance(entries, dict)
+            else [(self.generate_uuid4(), d) for d in entries]
+        )
+        created: List[str] = []
+        for id, data in items:
             key = self._key(id)
             if not overwrite and self._sync_client.exists(key):
                 continue
             if overwrite:
                 pipe.delete(key)
             pipe.hset(key, mapping=self._serialize_data(data))
-            ids_map[id] = id
+            created.append(id)
         pipe.execute()
-        # Apply TTL after pipeline since EXPIRE needs keys to exist
-        if ids_map:
+        if created:
             effective_ttl = ttl if ttl is not None else self.default_ttl
             if effective_ttl is not None:
                 ttl_pipe = self._sync_client.pipeline(transaction=False)
-                for id in ids_map:
+                for id in created:
                     ttl_pipe.expire(self._key(id), effective_ttl)
                 ttl_pipe.execute()
-        return ids_map
+        return {id: id for id in created} if isinstance(entries, dict) else created
 
     def bulk_read(self, ids: List[str]) -> Dict[str, Optional[Dict[str, Union[str, bool]]]]:
         """Read multiple hash entries using pipeline."""
@@ -1119,30 +1126,34 @@ class RedisHashUtil:
 
     async def async_bulk_create(
         self,
-        entries: Dict[str, Dict[str, Any]],
+        entries: Union[Dict[str, Dict[str, Any]], List[Dict[str, Any]]],
         overwrite: bool = False,
         ttl: Optional[int] = None,
-    ) -> Dict[str, str]:
+    ) -> Union[Dict[str, str], List[str]]:
         """Async: Create multiple hash entries using pipeline."""
-        ids_map: Dict[str, str] = {}
         pipe = self._async_client.pipeline(transaction=False)
-        for id, data in entries.items():
+        items: List[tuple[str, Dict[str, Any]]] = (
+            list(entries.items()) if isinstance(entries, dict)
+            else [(self.generate_uuid4(), d) for d in entries]
+        )
+        created: List[str] = []
+        for id, data in items:
             key = self._key(id)
             if not overwrite and await self._async_client.exists(key):
                 continue
             if overwrite:
                 pipe.delete(key)
             pipe.hset(key, mapping=self._serialize_data(data))
-            ids_map[id] = id
+            created.append(id)
         await pipe.execute()
-        if ids_map:
+        if created:
             effective_ttl = ttl if ttl is not None else self.default_ttl
             if effective_ttl is not None:
                 ttl_pipe = self._async_client.pipeline(transaction=False)
-                for id in ids_map:
+                for id in created:
                     ttl_pipe.expire(self._key(id), effective_ttl)
                 await ttl_pipe.execute()
-        return ids_map
+        return {id: id for id in created} if isinstance(entries, dict) else created
 
     async def async_bulk_read(self, ids: List[str]) -> Dict[str, Optional[Dict[str, Union[str, bool]]]]:
         """Async: Read multiple hash entries using pipeline."""
