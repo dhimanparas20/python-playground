@@ -64,6 +64,8 @@ pip install redis bcrypt
 
 A comprehensive utility for Redis **hash** operations. Each entry is a Redis HASH with multiple fields, namespaced under a prefix. Designed as a full database replacement for entity storage.
 
+> **Type preservation:** All hash values are JSON-serialized on write and deserialized on read. `int`, `float`, `bool`, `None`, `str`, `list`, and `dict` values round-trip with exact Python types. Atomic increment (`HINCRBY`/`HINCRBYFLOAT`) works seamlessly since numeric JSON strings are valid Redis counters.
+
 ### RedisHashUtil Constructor
 
 ```python
@@ -102,6 +104,10 @@ workers.create({"username": "temp"}, id="u-temp", ttl=3600)
 data = workers.read("u-001")                    # {"username": "alice", ...}
 email = workers.read("u-001", field="email")    # "alice@example.com"
 
+# All values preserve their Python types (bool, int, float, None, list, dict)
+workers.create({"name": "Alice", "age": 33, "active": False, "tags": ["a", "b"]})
+data = workers.read(id)  # age → 33 (int), active → False (bool), tags → ["a", "b"] (list)
+
 # Update — merge fields into existing entry
 workers.update("u-001", {"role": "superadmin", "last_login": "2026-01-15"})
 
@@ -139,13 +145,20 @@ data = workers.get_or_create("u-001", {"username": "alice", "status": "pending"}
 All bulk operations use **pipelines** — no N+1 round trips.
 
 ```python
-# Bulk create
+# Bulk create — dict form (explicit ids)
 entries = {
     "u-001": {"name": "Alice", "role": "admin"},
     "u-002": {"name": "Bob", "role": "user"},
-    "u-003": {"name": "Charlie", "role": "user"},
 }
 created = workers.bulk_create(entries, overwrite=True)
+# {"u-001": "u-001", "u-002": "u-002"}
+
+# Bulk create — list form (auto-generated UUIDs)
+ids = workers.bulk_create([
+    {"name": "Alice", "role": "admin"},
+    {"name": "Bob", "role": "user"},
+], overwrite=True)
+# ["f68fab41-...", "db4b9b62-..."]
 
 # Bulk read
 data = workers.bulk_read(["u-001", "u-002", "u-003"])
@@ -225,8 +238,10 @@ workers.bulk_expire(["u-001", "u-002"], 3600)
 Linear SCAN-based search. For indexed lookups, use [Secondary Indexes](#secondary-indexes).
 
 ```python
-# Exact match
-admins = workers.search("role", "admin")  # ["u-001", "u-003"]
+# Exact match (supports any type — str, int, bool, etc.)
+admins = workers.search("role", "admin")       # ["u-001", "u-003"]
+admins = workers.search("active", True)         # find active=True entries
+admins = workers.search("age", 33)              # find age = 33 entries
 
 # Substring match
 ali = workers.search("username", "ali", exact=False)  # ["u-001"]
@@ -382,6 +397,11 @@ user = cache.retrieve("user:999", default={"name": "Nobody"})
 # Upsert — silent overwrite (never raises)
 cache.upsert("user:123", {"name": "Alice", "role": "superadmin"})
 
+# with_ttl=True — returns (data, remaining_ttl) alongside the value
+value, remaining = cache.retrieve("user:123", with_ttl=True)
+stored, ttl = cache.store("user:456", {"x": 1}, ttl=120, with_ttl=True)
+exists, ttl = cache.exists("user:123", with_ttl=True)
+
 # Delete one or more keys
 cache.delete("user:123")
 cache.delete("key1", "key2", "key3")
@@ -389,6 +409,16 @@ cache.delete("key1", "key2", "key3")
 # Check existence
 cache.exists("user:123")   # True
 cache.exists("user:999")   # False
+```
+
+### `with_ttl=True` — Get Data and TTL in One Call
+
+On any non-bulk sync or async method (`store`, `retrieve`, `upsert`, `exists`, `store_if_not_exists`, `get_or_set`, `expire`, `persist`), pass `with_ttl=True` to receive a `(data, seconds_to_live)` tuple instead of just the data.
+
+```python
+value, ttl = cache.retrieve("user:123", with_ttl=True)
+ok, ttl = cache.store("user:456", data, ttl=300, with_ttl=True)
+ok, ttl = cache.exists("user:123", with_ttl=True)
 ```
 
 ### Cache-Aside Pattern
@@ -414,14 +444,23 @@ result = cache.get_or_set("user:456", lambda: expensive_db_query("456"), ttl=300
 
 # With a static default value (no callable)
 config = cache.get_or_set("config:features", {"dark_mode": True, "beta": False})
+
+# with_ttl=True on get_or_set — get value and remaining TTL in one call
+value, remaining = cache.get_or_set("user:456", lambda: expensive_db_query("456"), ttl=300, with_ttl=True)
 ```
 
-### Atomic Operations
+### Numeric Operations
 
 ```python
 # Store only if key does not exist (SET NX)
 cache.store_if_not_exists("lock:job:123", "worker-1")   # True
 cache.store_if_not_exists("lock:job:123", "worker-2")   # False (already exists)
+
+# Non-atomic increment / decrement (GET+SET, approximate counters)
+cache.increment("page_views:homepage")             # 1
+cache.increment("page_views:homepage", 5)           # 6
+cache.decrement("rate_limit:user:42")              # -1
+cache.decrement("rate_limit:user:42", amount=2)     # -3
 ```
 
 ### Cache TTL Operations
@@ -435,6 +474,10 @@ cache.ttl("user:123")   # seconds remaining (-1 = permanent, -2 = missing)
 
 # Remove TTL (make permanent)
 cache.persist("user:123")
+
+# with_ttl on TTL methods — returns (bool, seconds) alongside the result
+ok, remaining = cache.expire("user:123", 3600, with_ttl=True)
+ok, ttl = cache.persist("user:123", with_ttl=True)
 
 # Bulk expire
 cache.bulk_expire(["user:123", "user:456"], 3600)
@@ -552,7 +595,7 @@ async def main():
 asyncio.run(main())
 ```
 
-**Available async methods:** `async_store`, `async_retrieve`, `async_upsert`, `async_delete`, `async_exists`, `async_get_or_set`, `async_bulk_store`, `async_bulk_retrieve`, `async_invalidate_pattern`, `async_count`, `async_flush_all`, `async_close`.
+**Available async methods:** `async_store`, `async_retrieve`, `async_upsert`, `async_increment`, `async_decrement`, `async_delete`, `async_exists`, `async_get_or_set`, `async_bulk_store`, `async_bulk_retrieve`, `async_invalidate_pattern`, `async_count`, `async_flush_all`, `async_close`.
 
 ---
 
