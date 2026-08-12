@@ -3,8 +3,9 @@ Redis Utility Classes
 A production-ready, all-in-one utility for Redis (Valkey) operations.
 
 Modules:
-    RedisHashUtil    — Hash-based persistent storage (database replacement).
-    RedisCacheManager — String-based caching layer with TTL-first design.
+    RedisHashUtil     — Hash-based persistent storage (database replacement).
+    RedisStringUtil   — String-based key-value storage with optional TTL.
+    RedisCache        — Caching layer built on top of RedisStringUtil.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import random
 import secrets
 import string
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypeVar, Union
@@ -36,6 +38,62 @@ except ImportError:
 
 
 T = TypeVar("T")
+
+_REDIS_URL_SCHEMES: tuple = ("redis", "rediss", "unix")
+
+
+def validate_redis_connection(url: str, timeout: float = 5.0) -> None:
+    """
+    Validate a Redis/Valkey connection URL and verify connectivity.
+
+    Called automatically at the start of every class constructor in this
+    module (``RedisHashUtil``, ``RedisStringUtil``, ``RedisCache``) so that
+    invalid URLs and unreachable servers are caught at instantiation time
+    instead of failing silently on the first operation.
+
+    The URL is first checked for structure (supported scheme and a host),
+    then a lightweight ``PING`` probe is issued against the server.
+
+    Args:
+        url: Redis connection URL, e.g. ``"redis://localhost:6379/0"``.
+        timeout: Socket timeout in seconds for the connectivity probe.
+                 Defaults to 5.0.
+
+    Raises:
+        ValueError: If the URL is empty, malformed, or uses a scheme other
+            than ``redis``, ``rediss``, or ``unix``.
+        ConnectionError: If the Redis server cannot be reached or does not
+            respond to ``PING``.
+
+    Example:
+        >>> validate_redis_connection("redis://localhost:6379/0")
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("Redis connection URL cannot be empty.")
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError as exc:
+        raise ValueError(f"Malformed Redis connection URL: {url!r}") from exc
+    if parsed.scheme not in _REDIS_URL_SCHEMES:
+        raise ValueError(
+            f"Unsupported Redis URL scheme {parsed.scheme!r} in {url!r}. "
+            f"Expected one of: {', '.join(_REDIS_URL_SCHEMES)}."
+        )
+    if parsed.scheme != "unix" and not parsed.hostname:
+        raise ValueError(f"Redis connection URL is missing a host: {url!r}")
+
+    probe = redis.Redis.from_url(
+        url,
+        decode_responses=True,
+        socket_connect_timeout=timeout,
+        socket_timeout=timeout,
+    )
+    try:
+        probe.ping()
+    except redis.exceptions.RedisError as exc:
+        raise ConnectionError(f"Could not connect to Redis at {url!r}: {exc}") from exc
+    finally:
+        probe.close()
 
 
 class RedisHashUtil:
@@ -78,7 +136,12 @@ class RedisHashUtil:
             ...     index_key="INDEX",
             ...     default_ttl=3600,
             ... )
+
+        Raises:
+            ValueError: If the Redis URL is invalid or has an unsupported scheme.
+            ConnectionError: If the Redis server cannot be reached.
         """
+        validate_redis_connection(url)
         self.url: str = url
         self.prefix: str = prefix.upper()
         self.index_key: str = index_key.upper()
@@ -1401,32 +1464,31 @@ class RedisHashUtil:
         self.close()
 
 
+
 # ══════════════════════════════════════════════
-# REDIS CACHE MANAGER — STRING-BASED CACHING
+# REDIS STRING UTIL — STRING-BASED STORAGE
 # ══════════════════════════════════════════════
 
 
 F = TypeVar("F", bound=Callable[..., Any])
 
 
-class RedisCacheManager:
+class RedisStringUtil:
     """
-    Production-ready Redis/Valkey caching layer using STRING type.
+    Production-ready Redis/Valkey string utility using the STRING type.
 
-    Designed for caching objects, API responses, computed results, and ephemeral
-    data. Every entry is stored as a JSON-serialized string with automatic TTL.
-    Follows the cache-aside (lazy-loading) pattern by default.
+    A general-purpose utility for storing whole values — strings, numbers,
+    booleans, lists, and dicts — as single JSON-serialized entries with
+    optional TTL. This is the STRING counterpart to ``RedisHashUtil``
+    (which operates on HASH entries).
 
-    Key format: ``{prefix}:{cache_key}``
+    Key format: ``{prefix}:{key}``
 
     Differences from RedisHashUtil:
         - Uses Redis STRING (``SET``/``GET``) instead of HASH (``HSET``/``HGET``).
-        - All values are JSON-serialized on write and deserialized on read.
-        - TTL is fully optional — set ``default_ttl`` for automatic expiry, or
-          leave as ``None`` for permanent entries (like RedisHashUtil).
-        - No secondary indexes or distributed locks — cache is stateless.
-        - Method names use cache semantics (``store``/``retrieve`` instead of
-          ``create``/``read``).
+        - Each entry is a single JSON-serialized value, not a set of fields.
+        - No secondary indexes, distributed locks, or field-level operations.
+        - Method names use string semantics (``set``/``get``).
 
     Attributes:
         url (str): Redis connection URL.
@@ -1434,35 +1496,45 @@ class RedisCacheManager:
         default_ttl (Optional[int]): Default TTL in seconds. None = permanent.
 
     Example:
-        >>> cache = RedisCacheManager(prefix="API:USERS", default_ttl=600)
-        >>> cache.store("user:123", {"name": "Alice", "role": "admin"})
-        >>> cache.retrieve("user:123")
+        >>> store = RedisStringUtil(prefix="API:USERS", default_ttl=600)
+        >>> store.set("user:123", {"name": "Alice", "role": "admin"})
+        >>> store.get("user:123")
         {"name": "Alice", "role": "admin"}
     """
 
     def __init__(
         self,
         url: str = "redis://localhost:6379/0",
-        prefix: str = "CACHE",
+        prefix: str = "STRING",
         default_ttl: Optional[int] = None,
+        _skip_validation: bool = False,
     ) -> None:
         """
-        Initialize RedisCacheManager instance.
+        Initialize RedisStringUtil instance.
 
         Args:
             url: Redis connection URL. Defaults to localhost:6379.
             prefix: Key prefix for namespace isolation (e.g., "API:USERS").
                     All keys will be namespaced as ``{prefix}:{key}``.
-            default_ttl: Default TTL in seconds for cached entries.
+            default_ttl: Default TTL in seconds for stored entries.
                          Defaults to None (permanent). Set a value like
                          3600 for automatic expiry, or pass ttl per-call.
+            _skip_validation: Internal only. When True, the connection
+                              validation is skipped (used by ``RedisCache``,
+                              which validates before wrapping this class).
 
         Example:
-            >>> # Ephemeral cache — entries auto-expire
-            >>> cache = RedisCacheManager(prefix="API:USERS", default_ttl=600)
-            >>> # Persistent cache — entries live forever
-            >>> cache = RedisCacheManager(prefix="CONFIG", default_ttl=None)
+            >>> # Ephemeral store — entries auto-expire
+            >>> store = RedisStringUtil(prefix="API:USERS", default_ttl=600)
+            >>> # Persistent store — entries live forever
+            >>> store = RedisStringUtil(prefix="CONFIG", default_ttl=None)
+
+        Raises:
+            ValueError: If the Redis URL is invalid or has an unsupported scheme.
+            ConnectionError: If the Redis server cannot be reached.
         """
+        if not _skip_validation:
+            validate_redis_connection(url)
         self.url: str = url
         self.prefix: str = prefix.upper()
         self.default_ttl: Optional[int] = default_ttl
@@ -1473,18 +1545,18 @@ class RedisCacheManager:
             self.url, decode_responses=True
         )
 
-    def _key(self, cache_key: str) -> str:
-        """Build full Redis key from prefix and cache_key."""
-        return f"{self.prefix}:{cache_key}"
+    def _key(self, key: str) -> str:
+        """Build full Redis key from prefix and key."""
+        return f"{self.prefix}:{key}"
 
     def _serialize(self, value: Any) -> str:
-        """Serialize a value to JSON string for storage."""
+        """Serialize a value to a JSON string for storage."""
         if isinstance(value, str):
             return value
         return json.dumps(value, ensure_ascii=False, default=str)
 
     def _deserialize(self, raw: Optional[str]) -> Optional[Any]:
-        """Deserialize a JSON string back to Python object."""
+        """Deserialize a JSON string back to a Python object."""
         if raw is None:
             return None
         try:
@@ -1508,26 +1580,25 @@ class RedisCacheManager:
     # SYNC CRUD OPERATIONS
     # ──────────────────────────────────────────────
 
-    def store(
+    def set(
         self,
-        cache_key: str,
+        key: str,
         value: Any,
         ttl: Optional[int] = None,
         overwrite: bool = False,
         with_ttl: bool = False,
     ) -> Union[bool, tuple[bool, int]]:
         """
-        Store a value in the cache.
+        Store a value at a key.
 
-        Serializes dicts/lists to JSON strings automatically. Strings are stored
-        as-is. If the key already exists and ``overwrite=False``, a ``ValueError``
-        is raised.
+        Serializes dicts/lists to JSON strings automatically. Strings are
+        stored as-is. If the key already exists and ``overwrite=False``, a
+        ``ValueError`` is raised.
 
         Args:
-            cache_key: Cache key (will be prefixed with ``{prefix}:``).
-            value: Value to cache. Dicts, lists, and primitives are JSON-serialized.
+            key: Key to store (will be prefixed with ``{prefix}:``).
+            value: Value to store. Dicts, lists, and primitives are JSON-serialized.
             ttl: TTL in seconds. Overrides ``default_ttl`` if provided.
-                 Use -1 for permanent entry.
             overwrite: If True, overwrite existing entries silently.
             with_ttl: If True, return ``(bool, seconds_to_live)`` instead of bool.
 
@@ -1538,72 +1609,72 @@ class RedisCacheManager:
             ValueError: If key exists and ``overwrite=False``.
 
         Example:
-            >>> cache.store("session:abc", {"user_id": "123", "role": "admin"})
+            >>> store.set("session:abc", {"user_id": "123", "role": "admin"})
             True
-            >>> cache.store("config:dark_mode", True, ttl=86400)
+            >>> store.set("config:dark_mode", True, ttl=86400)
             True
         """
-        key = self._key(cache_key)
-        if not overwrite and self._sync_client.exists(key):
+        full_key = self._key(key)
+        if not overwrite and self._sync_client.exists(full_key):
             raise ValueError(
-                f"Cache key '{key}' already exists. Use overwrite=True to replace."
+                f"Key '{full_key}' already exists. Use overwrite=True to replace."
             )
         serialized = self._serialize(value)
-        self._sync_client.set(key, serialized)
-        self._apply_ttl(key, ttl)
+        self._sync_client.set(full_key, serialized)
+        self._apply_ttl(full_key, ttl)
         if with_ttl:
-            return True, self._sync_client.ttl(key)
+            return True, self._sync_client.ttl(full_key)
         return True
 
-    def retrieve(
-        self, cache_key: str, default: Any = None, with_ttl: bool = False
+    def get(
+        self, key: str, default: Any = None, with_ttl: bool = False
     ) -> Union[Any, tuple[Any, int]]:
         """
-        Retrieve a cached value by key.
+        Retrieve a stored value by key.
 
         Deserializes JSON strings back to Python objects automatically.
         Returns ``default`` if the key does not exist.
 
         Args:
-            cache_key: Cache key to look up.
-            default: Value to return if key is missing. Defaults to None.
+            key: Key to look up.
+            default: Value to return if the key is missing. Defaults to None.
             with_ttl: If True, return ``(value, seconds_to_live)`` instead of value.
 
         Returns:
-            The cached value (deserialized), or ``default`` if not found.
+            The stored value (deserialized), or ``default`` if not found.
             If ``with_ttl=True``, returns ``(value, ttl)`` or ``(default, -2)``.
 
         Example:
-            >>> cache.retrieve("session:abc")
+            >>> store.get("session:abc")
             {"user_id": "123", "role": "admin"}
-            >>> cache.retrieve("missing:key", default=[])
+            >>> store.get("missing:key", default=[])
             []
         """
-        key = self._key(cache_key)
-        raw = self._sync_client.get(key)
+        full_key = self._key(key)
+        raw = self._sync_client.get(full_key)
         if raw is None:
             return (default, -2) if with_ttl else default
         value = self._deserialize(raw)
         if with_ttl:
-            return value, self._sync_client.ttl(key)
+            return value, self._sync_client.ttl(full_key)
         return value
 
     def upsert(
         self,
-        cache_key: str,
+        key: str,
         value: Any,
         ttl: Optional[int] = None,
         with_ttl: bool = False,
     ) -> Union[bool, tuple[bool, int]]:
         """
-        Store or update a cached value (create-or-update semantics).
+        Store or update a value at a key (create-or-update semantics).
 
-        Unlike ``store()``, this never raises ``ValueError`` — it silently
-        overwrites existing entries. Ideal for cache warming and refresh.
+        Unlike ``set()``, this never raises ``ValueError`` — it silently
+        overwrites existing entries.
 
         Args:
-            cache_key: Cache key.
-            value: Value to cache.
+            key: Key.
+            value: Value to store.
             ttl: TTL in seconds. Overrides ``default_ttl`` if provided.
             with_ttl: If True, return ``(bool, seconds_to_live)`` instead of bool.
 
@@ -1611,32 +1682,32 @@ class RedisCacheManager:
             True if the value was stored, or ``(True, ttl)`` if ``with_ttl=True``.
 
         Example:
-            >>> cache.upsert("config:theme", "dark")
+            >>> store.upsert("config:theme", "dark")
             True
         """
-        key = self._key(cache_key)
+        full_key = self._key(key)
         serialized = self._serialize(value)
-        self._sync_client.set(key, serialized)
-        self._apply_ttl(key, ttl)
+        self._sync_client.set(full_key, serialized)
+        self._apply_ttl(full_key, ttl)
         if with_ttl:
-            return True, self._sync_client.ttl(key)
+            return True, self._sync_client.ttl(full_key)
         return True
 
     def increment(
         self,
-        cache_key: str,
+        key: str,
         amount: Union[int, float] = 1,
         ttl: Optional[int] = None,
     ) -> Union[int, float]:
         """
-        Non-atomic increment stored numeric value.
+        Non-atomic increment of a stored numeric value.
 
         Fetches the current value (starting from 0 if absent), adds ``amount``,
-        and stores back. Since this is a GET + SET operation it is **not atomic**
-        — fine for approximate counters like page views or rate estimates.
+        and stores it back. Since this is a GET + SET operation it is **not
+        atomic** — fine for approximate counters like page views.
 
         Args:
-            cache_key: Cache key.
+            key: Key.
             amount: Amount to increment by (int or float). Defaults to 1.
             ttl: TTL in seconds. Overrides ``default_ttl`` if provided.
 
@@ -1644,32 +1715,32 @@ class RedisCacheManager:
             The new value after increment.
 
         Example:
-            >>> cache.increment("page_views:homepage")
+            >>> store.increment("page_views:homepage")
             1
-            >>> cache.increment("page_views:homepage", 5)
+            >>> store.increment("page_views:homepage", 5)
             6
-            >>> cache.increment("balance:42", -10)
+            >>> store.increment("balance:42", -10)
             -4
         """
-        current = self.retrieve(cache_key)
+        current = self.get(key)
         new_val = (current if current is not None else 0) + amount
-        self.upsert(cache_key, new_val, ttl=ttl)
+        self.upsert(key, new_val, ttl=ttl)
         return new_val
 
     def decrement(
         self,
-        cache_key: str,
+        key: str,
         amount: Union[int, float] = 1,
         ttl: Optional[int] = None,
     ) -> Union[int, float]:
         """
-        Non-atomic decrement stored numeric value.
+        Non-atomic decrement of a stored numeric value.
 
         Convenience wrapper around ``increment`` with a negated amount.
-        Starts from 0 if key does not exist.
+        Starts from 0 if the key does not exist.
 
         Args:
-            cache_key: Cache key.
+            key: Key.
             amount: Amount to decrement by (int or float). Defaults to 1.
             ttl: TTL in seconds. Overrides ``default_ttl`` if provided.
 
@@ -1677,45 +1748,45 @@ class RedisCacheManager:
             The new value after decrement.
 
         Example:
-            >>> cache.decrement("rate_limit:user:42")
+            >>> store.decrement("rate_limit:user:42")
             -1
         """
-        return self.increment(cache_key, -amount, ttl=ttl)
+        return self.increment(key, -amount, ttl=ttl)
 
-    def delete(self, *cache_keys: str) -> int:
+    def delete(self, *keys: str) -> int:
         """
-        Delete one or more cached entries.
+        Delete one or more stored entries.
 
         Args:
-            *cache_keys: One or more cache keys to delete.
+            *keys: One or more keys to delete.
 
         Returns:
             Number of keys actually deleted.
 
         Example:
-            >>> cache.delete("session:abc", "session:def")
+            >>> store.delete("session:abc", "session:def")
             2
         """
-        if not cache_keys:
+        if not keys:
             return 0
-        full_keys = [self._key(k) for k in cache_keys]
+        full_keys = [self._key(k) for k in keys]
         return int(self._sync_client.delete(*full_keys))
 
-    def exists(self, cache_key: str, with_ttl: bool = False) -> Union[bool, tuple[bool, int]]:
-        """Check if a cache key exists."""
-        key = self._key(cache_key)
-        exists = self._sync_client.exists(key)
+    def exists(self, key: str, with_ttl: bool = False) -> Union[bool, tuple[bool, int]]:
+        """Check if a key exists."""
+        full_key = self._key(key)
+        exists = self._sync_client.exists(full_key)
         if with_ttl:
-            return bool(exists), self._sync_client.ttl(key) if exists else -2
+            return bool(exists), self._sync_client.ttl(full_key) if exists else -2
         return bool(exists)
 
     # ──────────────────────────────────────────────
-    # ATOMIC / CACHE-ASIDE OPERATIONS
+    # ATOMIC OPERATIONS
     # ──────────────────────────────────────────────
 
-    def store_if_not_exists(
+    def set_if_not_exists(
         self,
-        cache_key: str,
+        key: str,
         value: Any,
         ttl: Optional[int] = None,
         with_ttl: bool = False,
@@ -1724,10 +1795,10 @@ class RedisCacheManager:
         Store a value only if the key does not already exist (atomic).
 
         Uses Redis ``SET NX`` under the hood. Useful for distributed
-        lock-free "claim" patterns (e.g., first-write-wins).
+        "first-write-wins" claim patterns.
 
         Args:
-            cache_key: Cache key.
+            key: Key.
             value: Value to store.
             ttl: TTL in seconds. Overrides ``default_ttl`` if provided.
             with_ttl: If True, return ``(bool, seconds_to_live)`` instead of bool.
@@ -1735,72 +1806,71 @@ class RedisCacheManager:
         Returns:
             True if the value was set (key did not exist), False otherwise.
             If ``with_ttl=True``, returns ``(True, ttl)`` on success,
-            ``(False, remaining_ttl)`` if key already exists.
+            ``(False, remaining_ttl)`` if the key already exists.
 
         Example:
-            >>> cache.store_if_not_exists("lock:job:123", "worker-1")
+            >>> store.set_if_not_exists("lock:job:123", "worker-1")
             True
-            >>> cache.store_if_not_exists("lock:job:123", "worker-2")
+            >>> store.set_if_not_exists("lock:job:123", "worker-2")
             False
         """
-        key = self._key(cache_key)
+        full_key = self._key(key)
         serialized = self._serialize(value)
         effective_ttl = ttl if ttl is not None else self.default_ttl
         if effective_ttl is not None and effective_ttl > 0:
-            result = self._sync_client.set(key, serialized, nx=True, ex=effective_ttl)
+            result = self._sync_client.set(full_key, serialized, nx=True, ex=effective_ttl)
         else:
-            result = self._sync_client.set(key, serialized, nx=True)
+            result = self._sync_client.set(full_key, serialized, nx=True)
         if with_ttl:
-            return bool(result), self._sync_client.ttl(key)
+            return bool(result), self._sync_client.ttl(full_key)
         return bool(result)
 
     def get_or_set(
         self,
-        cache_key: str,
+        key: str,
         factory: Union[Callable[[], Any], Any],
         ttl: Optional[int] = None,
         with_ttl: bool = False,
     ) -> Union[Any, tuple[Any, int]]:
         """
-        Cache-aside (lazy-loading) pattern: retrieve existing value, or compute
-        and cache a new one.
+        Retrieve an existing value, or compute and store a new one.
 
         If the key exists, its value is returned immediately. If not, ``factory``
         is called (if callable) or ``factory`` is used directly as the value,
-        stored in cache, and returned.
+        stored, and returned.
 
         Args:
-            cache_key: Cache key.
-            factory: A callable that produces the value on cache miss, or a
-                     static value to store on miss.
+            key: Key.
+            factory: A callable that produces the value on a miss, or a
+                     static value to store on a miss.
             ttl: TTL in seconds for the new entry. Overrides ``default_ttl``
                  if provided.
             with_ttl: If True, return ``(value, seconds_to_live)`` instead of value.
 
         Returns:
-            The cached or freshly computed value.
+            The stored or freshly computed value.
             If ``with_ttl=True``, returns ``(value, ttl)``.
 
         Example:
             >>> # With a factory function (lazy computation)
-            >>> cache.get_or_set("user:123", lambda: expensive_db_query("123"))
+            >>> store.get_or_set("user:123", lambda: expensive_query("123"))
             {"name": "Alice", "role": "admin"}
 
             >>> # With a static default
-            >>> cache.get_or_set("config:feature_x", {"enabled": True})
+            >>> store.get_or_set("config:feature_x", {"enabled": True})
             {"enabled": True}
         """
-        key = self._key(cache_key)
-        raw = self._sync_client.get(key)
+        full_key = self._key(key)
+        raw = self._sync_client.get(full_key)
         if raw is not None:
             value = self._deserialize(raw)
             if with_ttl:
-                return value, self._sync_client.ttl(key)
+                return value, self._sync_client.ttl(full_key)
             return value
         value = factory() if callable(factory) else factory
-        self.upsert(cache_key, value, ttl=ttl)
+        self.upsert(key, value, ttl=ttl)
         if with_ttl:
-            return value, self._sync_client.ttl(key)
+            return value, self._sync_client.ttl(full_key)
         return value
 
     # ──────────────────────────────────────────────
@@ -1808,76 +1878,76 @@ class RedisCacheManager:
     # ──────────────────────────────────────────────
 
     def expire(
-        self, cache_key: str, seconds: int, with_ttl: bool = False
+        self, key: str, seconds: int, with_ttl: bool = False
     ) -> Union[bool, tuple[bool, int]]:
         """
-        Set TTL on an existing cache entry.
+        Set TTL on an existing entry.
 
         Args:
-            cache_key: Cache key.
-            with_ttl: If True, return ``(bool, seconds_to_live)`` instead of bool.
+            key: Key.
             seconds: TTL in seconds.
+            with_ttl: If True, return ``(bool, seconds_to_live)`` instead of bool.
 
         Returns:
-            True if timeout was set, False if key does not exist.
+            True if the timeout was set, False if the key does not exist.
 
         Example:
-            >>> cache.expire("session:abc", 7200)
+            >>> store.expire("session:abc", 7200)
             True
         """
-        result = bool(self._sync_client.expire(self._key(cache_key), seconds))
+        result = bool(self._sync_client.expire(self._key(key), seconds))
         if with_ttl:
-            key = self._key(cache_key)
-            return result, self._sync_client.ttl(key) if result else -2
+            full_key = self._key(key)
+            return result, self._sync_client.ttl(full_key) if result else -2
         return result
 
-    def bulk_expire(self, cache_keys: List[str], seconds: int) -> int:
+    def bulk_expire(self, keys: List[str], seconds: int) -> int:
         """
-        Set TTL on multiple cache entries using pipeline.
+        Set TTL on multiple entries using a pipeline.
 
         Args:
-            cache_keys: List of cache keys.
+            keys: List of keys.
             seconds: TTL in seconds.
 
         Returns:
             Number of entries updated.
 
         Example:
-            >>> cache.bulk_expire(["k1", "k2", "k3"], 1800)
+            >>> store.bulk_expire(["k1", "k2", "k3"], 1800)
             3
         """
-        if not cache_keys:
+        if not keys:
             return 0
         pipe = self._sync_client.pipeline(transaction=False)
-        for k in cache_keys:
+        for k in keys:
             pipe.expire(self._key(k), seconds)
         results = pipe.execute()
         return sum(results)
 
-    def ttl(self, cache_key: str) -> int:
+    def ttl(self, key: str) -> int:
         """
-        Get remaining TTL of a cache entry.
+        Get the remaining TTL of an entry.
 
         Args:
-            cache_key: Cache key.
+            key: Key.
 
         Returns:
-            Remaining seconds, -1 if no expiry, -2 if key does not exist.
+            Remaining seconds, -1 if no expiry, -2 if the key does not exist.
 
         Example:
-            >>> cache.ttl("session:abc")
+            >>> store.ttl("session:abc")
             5400
         """
-        return self._sync_client.ttl(self._key(cache_key))
+        return self._sync_client.ttl(self._key(key))
 
     def persist(
-        self, cache_key: str, with_ttl: bool = False
+        self, key: str, with_ttl: bool = False
     ) -> Union[bool, tuple[bool, int]]:
         """
-        Remove TTL from a cache entry (make it permanent).
+        Remove TTL from an entry (make it permanent).
 
         Args:
-            cache_key: Cache key.
+            key: Key.
             with_ttl: If True, return ``(bool, seconds_to_live)`` instead of bool.
 
         Returns:
@@ -1885,29 +1955,29 @@ class RedisCacheManager:
             If ``with_ttl=True``, returns ``(True, -1)`` on success.
 
         Example:
-            >>> cache.persist("config:feature_x")
+            >>> store.persist("config:feature_x")
             True
         """
-        result = bool(self._sync_client.persist(self._key(cache_key)))
+        result = bool(self._sync_client.persist(self._key(key)))
         if with_ttl:
-            return result, self._sync_client.ttl(self._key(cache_key))
+            return result, self._sync_client.ttl(self._key(key))
         return result
 
     # ──────────────────────────────────────────────
     # BULK OPERATIONS
     # ──────────────────────────────────────────────
 
-    def bulk_store(
+    def bulk_set(
         self,
         entries: Dict[str, Any],
         ttl: Optional[int] = None,
         overwrite: bool = False,
     ) -> int:
         """
-        Store multiple values using pipeline.
+        Store multiple values in a pipeline.
 
         Args:
-            entries: Dict mapping cache keys to values.
+            entries: Dict mapping keys to values.
             ttl: TTL in seconds. Overrides ``default_ttl`` if provided.
             overwrite: If True, overwrite existing entries.
 
@@ -1915,77 +1985,77 @@ class RedisCacheManager:
             Number of entries stored.
 
         Example:
-            >>> cache.bulk_store({"k1": [1, 2], "k2": {"a": 1}, "k3": "text"})
+            >>> store.bulk_set({"k1": [1, 2], "k2": {"a": 1}, "k3": "text"})
             3
         """
         if not entries:
             return 0
         pipe = self._sync_client.pipeline(transaction=False)
         stored = 0
-        for cache_key, value in entries.items():
-            key = self._key(cache_key)
-            if not overwrite and self._sync_client.exists(key):
+        for key, value in entries.items():
+            full_key = self._key(key)
+            if not overwrite and self._sync_client.exists(full_key):
                 continue
             serialized = self._serialize(value)
-            pipe.set(key, serialized)
+            pipe.set(full_key, serialized)
             stored += 1
         pipe.execute()
         if stored > 0:
             effective_ttl = ttl if ttl is not None else self.default_ttl
             if effective_ttl is not None and effective_ttl > 0:
                 ttl_pipe = self._sync_client.pipeline(transaction=False)
-                for cache_key in entries:
-                    ttl_pipe.expire(self._key(cache_key), effective_ttl)
+                for key in entries:
+                    ttl_pipe.expire(self._key(key), effective_ttl)
                 ttl_pipe.execute()
         return stored
 
-    def bulk_retrieve(
-        self, cache_keys: List[str], default: Any = None
+    def bulk_get(
+        self, keys: List[str], default: Any = None
     ) -> Dict[str, Any]:
         """
-        Retrieve multiple cached values using pipeline.
+        Retrieve multiple stored values in a pipeline.
 
         Args:
-            cache_keys: List of cache keys to look up.
+            keys: List of keys to look up.
             default: Value to return for missing keys.
 
         Returns:
-            Dict mapping cache keys to their values (or ``default``).
+            Dict mapping keys to their values (or ``default``).
 
         Example:
-            >>> cache.bulk_retrieve(["k1", "k2", "missing"])
+            >>> store.bulk_get(["k1", "k2", "missing"])
             {"k1": [1, 2], "k2": {"a": 1}, "missing": None}
         """
-        if not cache_keys:
+        if not keys:
             return {}
         pipe = self._sync_client.pipeline(transaction=False)
-        for cache_key in cache_keys:
-            pipe.get(self._key(cache_key))
+        for key in keys:
+            pipe.get(self._key(key))
         results = pipe.execute()
         output: Dict[str, Any] = {}
-        for cache_key, raw in zip(cache_keys, results):
-            output[cache_key] = self._deserialize(raw) if raw is not None else default
+        for key, raw in zip(keys, results):
+            output[key] = self._deserialize(raw) if raw is not None else default
         return output
 
-    def bulk_delete(self, cache_keys: List[str]) -> int:
+    def bulk_delete(self, keys: List[str]) -> int:
         """
-        Delete multiple cache entries using pipeline.
+        Delete multiple entries in a pipeline.
 
         Args:
-            cache_keys: List of cache keys to delete.
+            keys: List of keys to delete.
 
         Returns:
             Number of keys actually deleted.
 
         Example:
-            >>> cache.bulk_delete(["k1", "k2", "k3"])
+            >>> store.bulk_delete(["k1", "k2", "k3"])
             3
         """
-        if not cache_keys:
+        if not keys:
             return 0
         pipe = self._sync_client.pipeline(transaction=False)
-        for cache_key in cache_keys:
-            pipe.delete(self._key(cache_key))
+        for key in keys:
+            pipe.delete(self._key(key))
         results = pipe.execute()
         return sum(results)
 
@@ -1993,23 +2063,22 @@ class RedisCacheManager:
     # PATTERN / NAMESPACE OPERATIONS
     # ──────────────────────────────────────────────
 
-    def invalidate_pattern(self, pattern: str, batch_size: int = 1000) -> int:
+    def delete_pattern(self, pattern: str, batch_size: int = 1000) -> int:
         """
-        Delete all cache entries matching a glob pattern under this prefix.
+        Delete all entries matching a glob pattern under this prefix.
 
-        Uses SCAN for non-blocking iteration. Useful for invalidating a
-        subset of cached data (e.g., all ``user:*`` keys).
+        Uses SCAN for non-blocking iteration.
 
         Args:
             pattern: Glob pattern to match (appended to prefix).
-                     Example: ``"user:*"`` matches ``CACHE:user:123``.
+                     Example: ``"user:*"`` matches ``STRING:user:123``.
             batch_size: SCAN batch size.
 
         Returns:
             Number of keys deleted.
 
         Example:
-            >>> cache.invalidate_pattern("session:*")
+            >>> store.delete_pattern("session:*")
             42
         """
         search = f"{self.prefix}:{pattern}"
@@ -2029,30 +2098,30 @@ class RedisCacheManager:
                 break
         return deleted
 
-    def invalidate_namespace(self, namespace: str, batch_size: int = 1000) -> int:
+    def delete_namespace(self, namespace: str, batch_size: int = 1000) -> int:
         """
-        Delete all cache entries under a sub-namespace.
+        Delete all entries under a sub-namespace.
 
-        A convenience wrapper around ``invalidate_pattern`` that matches
+        A convenience wrapper around ``delete_pattern`` that matches
         everything under ``{namespace}:*``.
 
         Args:
             namespace: Sub-namespace to clear (e.g., "user" clears
-                       ``CACHE:user:123``, ``CACHE:user:456``, etc.).
+                       ``STRING:user:123``, ``STRING:user:456``, etc.).
             batch_size: SCAN batch size.
 
         Returns:
             Number of keys deleted.
 
         Example:
-            >>> cache.invalidate_namespace("session")
+            >>> store.delete_namespace("session")
             150
         """
-        return self.invalidate_pattern(f"{namespace}*", batch_size=batch_size)
+        return self.delete_pattern(f"{namespace}*", batch_size=batch_size)
 
-    def flush_all(self, batch_size: int = 1000) -> int:
+    def delete_all(self, batch_size: int = 1000) -> int:
         """
-        Delete ALL cache entries under this prefix (dangerous).
+        Delete ALL entries under this prefix (dangerous).
 
         Uses SCAN to iterate — safe for production (non-blocking).
 
@@ -2063,10 +2132,10 @@ class RedisCacheManager:
             Number of keys deleted.
 
         Example:
-            >>> cache.flush_all()
+            >>> store.delete_all()
             1024
         """
-        return self.invalidate_pattern("*", batch_size=batch_size)
+        return self.delete_pattern("*", batch_size=batch_size)
 
     # ──────────────────────────────────────────────
     # INSPECTION / STATS
@@ -2074,7 +2143,7 @@ class RedisCacheManager:
 
     def count(self, pattern: Optional[str] = None, batch_size: int = 1000) -> int:
         """
-        Count cache entries under this prefix.
+        Count entries under this prefix.
 
         Args:
             pattern: Optional sub-pattern to match.
@@ -2084,9 +2153,9 @@ class RedisCacheManager:
             Number of matching keys.
 
         Example:
-            >>> cache.count()
+            >>> store.count()
             256
-            >>> cache.count(pattern="user:*")
+            >>> store.count(pattern="user:*")
             42
         """
         search = f"{self.prefix}:{pattern}*" if pattern else f"{self.prefix}:*"
@@ -2109,7 +2178,7 @@ class RedisCacheManager:
         batch_size: int = 1000,
     ) -> List[str]:
         """
-        List cache keys under this prefix with optional pagination.
+        List keys under this prefix with optional pagination.
 
         Args:
             pattern: Optional sub-pattern to match.
@@ -2118,10 +2187,10 @@ class RedisCacheManager:
             batch_size: SCAN batch size.
 
         Returns:
-            List of cache keys (without prefix).
+            List of keys (without prefix).
 
         Example:
-            >>> cache.list_keys(pattern="user:*", limit=10)
+            >>> store.list_keys(pattern="user:*", limit=10)
             ["user:123", "user:456", ...]
         """
         search = f"{self.prefix}:{pattern}*" if pattern else f"{self.prefix}:*"
@@ -2142,14 +2211,14 @@ class RedisCacheManager:
 
     def stats(self) -> Dict[str, Any]:
         """
-        Get cache statistics from Redis ``INFO`` command.
+        Get Redis server statistics from the ``INFO`` command.
 
         Returns:
             Dict with ``used_memory``, ``used_memory_human``,
             ``keyspace_hits``, ``keyspace_misses``, and computed ``hit_rate``.
 
         Example:
-            >>> cache.stats()
+            >>> store.stats()
             {"used_memory": 1048576, "hit_rate": 0.95, ...}
         """
         info = self._sync_client.info("stats")
@@ -2178,7 +2247,7 @@ class RedisCacheManager:
         indent: int = 2,
     ) -> int:
         """
-        Export all cached entries to a JSON file.
+        Export all entries under this prefix to a JSON file.
 
         Args:
             filepath: Output file path.
@@ -2189,7 +2258,7 @@ class RedisCacheManager:
             Number of entries exported.
 
         Example:
-            >>> cache.export_json("/tmp/cache_backup.json")
+            >>> store.export_json("/tmp/backup.json")
             256
         """
         search = f"{self.prefix}:{pattern}*" if pattern else f"{self.prefix}:*"
@@ -2204,8 +2273,8 @@ class RedisCacheManager:
                 raw_list = pipe.execute()
                 for key, raw in zip(keys, raw_list):
                     if raw is not None:
-                        cache_key = key.removeprefix(f"{self.prefix}:")
-                        entries[cache_key] = self._deserialize(raw)
+                        bare_key = key.removeprefix(f"{self.prefix}:")
+                        entries[bare_key] = self._deserialize(raw)
             if cursor == 0:
                 break
         export_data = {"prefix": self.prefix, "entries": entries}
@@ -2222,7 +2291,7 @@ class RedisCacheManager:
         ttl: Optional[int] = None,
     ) -> int:
         """
-        Import cached entries from a JSON file.
+        Import entries from a JSON file.
 
         Args:
             filepath: Input file path.
@@ -2233,7 +2302,7 @@ class RedisCacheManager:
             Number of entries imported.
 
         Example:
-            >>> cache.import_json("/tmp/cache_backup.json")
+            >>> store.import_json("/tmp/backup.json")
             256
         """
         with open(filepath, "r", encoding="utf-8") as f:
@@ -2241,20 +2310,20 @@ class RedisCacheManager:
         entries = import_data.get("entries", {})
         stored = 0
         pipe = self._sync_client.pipeline(transaction=False)
-        for cache_key, value in entries.items():
-            key = self._key(cache_key)
-            if not overwrite and self._sync_client.exists(key):
+        for key, value in entries.items():
+            full_key = self._key(key)
+            if not overwrite and self._sync_client.exists(full_key):
                 continue
             serialized = self._serialize(value)
-            pipe.set(key, serialized)
+            pipe.set(full_key, serialized)
             stored += 1
         pipe.execute()
         if stored > 0:
             effective_ttl = ttl if ttl is not None else self.default_ttl
             if effective_ttl is not None and effective_ttl > 0:
                 ttl_pipe = self._sync_client.pipeline(transaction=False)
-                for cache_key in entries:
-                    ttl_pipe.expire(self._key(cache_key), effective_ttl)
+                for key in entries:
+                    ttl_pipe.expire(self._key(key), effective_ttl)
                 ttl_pipe.execute()
         return stored
 
@@ -2262,7 +2331,7 @@ class RedisCacheManager:
         self, pattern: Optional[str] = None, indent: int = 2
     ) -> str:
         """
-        Export all cached entries to a JSON string.
+        Export all entries under this prefix to a JSON string.
 
         Args:
             pattern: Optional sub-pattern to match.
@@ -2272,7 +2341,7 @@ class RedisCacheManager:
             JSON string of all entries.
 
         Example:
-            >>> json_str = cache.export_json_string()
+            >>> json_str = store.export_json_string()
         """
         search = f"{self.prefix}:{pattern}*" if pattern else f"{self.prefix}:*"
         entries: Dict[str, Any] = {}
@@ -2286,8 +2355,8 @@ class RedisCacheManager:
                 raw_list = pipe.execute()
                 for key, raw in zip(keys, raw_list):
                     if raw is not None:
-                        cache_key = key.removeprefix(f"{self.prefix}:")
-                        entries[cache_key] = self._deserialize(raw)
+                        bare_key = key.removeprefix(f"{self.prefix}:")
+                        entries[bare_key] = self._deserialize(raw)
             if cursor == 0:
                 break
         export_data = {"prefix": self.prefix, "entries": entries}
@@ -2300,7 +2369,7 @@ class RedisCacheManager:
         ttl: Optional[int] = None,
     ) -> int:
         """
-        Import cached entries from a JSON string.
+        Import entries from a JSON string.
 
         Args:
             json_str: JSON string containing entries.
@@ -2311,64 +2380,63 @@ class RedisCacheManager:
             Number of entries imported.
 
         Example:
-            >>> cache.import_json_string(json_str)
+            >>> store.import_json_string(json_str)
             128
         """
         import_data = json.loads(json_str)
         entries = import_data.get("entries", {})
         stored = 0
         pipe = self._sync_client.pipeline(transaction=False)
-        for cache_key, value in entries.items():
-            key = self._key(cache_key)
-            if not overwrite and self._sync_client.exists(key):
+        for key, value in entries.items():
+            full_key = self._key(key)
+            if not overwrite and self._sync_client.exists(full_key):
                 continue
             serialized = self._serialize(value)
-            pipe.set(key, serialized)
+            pipe.set(full_key, serialized)
             stored += 1
         pipe.execute()
         if stored > 0:
             effective_ttl = ttl if ttl is not None else self.default_ttl
             if effective_ttl is not None and effective_ttl > 0:
                 ttl_pipe = self._sync_client.pipeline(transaction=False)
-                for cache_key in entries:
-                    ttl_pipe.expire(self._key(cache_key), effective_ttl)
+                for key in entries:
+                    ttl_pipe.expire(self._key(key), effective_ttl)
                 ttl_pipe.execute()
         return stored
 
     # ──────────────────────────────────────────────
-    # DECORATOR — FUNCTION RESULT CACHING
+    # DECORATOR — FUNCTION RESULT MEMOIZATION
     # ──────────────────────────────────────────────
 
-    def cache_result(
+    def memoize(
         self,
         ttl: Optional[int] = None,
         key_prefix: str = "",
         fallback: Optional[Callable] = None,
     ) -> Callable[[F], F]:
         """
-        Decorator that caches a function's return value.
+        Decorator that stores a function's return value.
 
-        The cache key is derived from the function's module, name, and
-        arguments. On cache hit, the stored result is returned without
-        calling the function. On miss, the function is called, its result
-        is cached, and returned.
+        The key is derived from the function's module, name, and arguments.
+        On a hit, the stored result is returned without calling the function.
+        On a miss, the function is called, its result stored, and returned.
 
         Args:
-            ttl: TTL in seconds for the cached result. Overrides ``default_ttl``.
-            key_prefix: Optional prefix added to the cache key for namespacing.
+            ttl: TTL in seconds for the stored result. Overrides ``default_ttl``.
+            key_prefix: Optional prefix added to the key for namespacing.
             fallback: Optional callable invoked on Redis errors. Receives the
                       original function and its arguments. If not provided,
                       the exception propagates.
 
         Returns:
-            A decorator that wraps the function with caching logic.
+            A decorator that wraps the function with result-storing logic.
 
         Example:
-            >>> @cache.cache_result(ttl=300)
+            >>> @store.memoize(ttl=300)
             ... def get_user(user_id: str) -> dict:
             ...     return db.query_user(user_id)
 
-            >>> @cache.cache_result(ttl=60, key_prefix="api")
+            >>> @store.memoize(ttl=60, key_prefix="api")
             ... def fetch_products(category: str) -> list:
             ...     return api.get_products(category)
         """
@@ -2382,24 +2450,24 @@ class RedisCacheManager:
                 key_parts.extend([repr(a) for a in args])
                 key_parts.extend([f"{k}={repr(v)}" for k, v in sorted(kwargs.items())])
                 raw_key = ":".join(key_parts)
-                cache_key = (
+                memo_key = (
                     hashlib.sha256(raw_key.encode()).hexdigest()[:32]
                     if len(raw_key) > 128
                     else raw_key
                 )
                 try:
-                    existing = self.retrieve(cache_key)
+                    existing = self.get(memo_key)
                     if existing is not None:
                         return existing
                     result = func(*args, **kwargs)
-                    self.upsert(cache_key, result, ttl=ttl)
+                    self.upsert(memo_key, result, ttl=ttl)
                     return result
                 except Exception as e:
                     if fallback is not None:
                         return fallback(func, *args, **kwargs)
                     raise e
 
-            wrapper.cache_clear = lambda *a, **kw: self.invalidate_pattern(  # type: ignore
+            wrapper.clear = lambda *a, **kw: self.delete_pattern(  # type: ignore
                 f"{key_prefix or func.__qualname__}*"
             )
             return wrapper  # type: ignore
@@ -2410,140 +2478,158 @@ class RedisCacheManager:
     # ASYNC CRUD OPERATIONS
     # ──────────────────────────────────────────────
 
-    async def async_store(
+    async def async_set(
         self,
-        cache_key: str,
+        key: str,
         value: Any,
         ttl: Optional[int] = None,
         overwrite: bool = False,
     ) -> bool:
-        """Async: Store a value in the cache."""
-        key = self._key(cache_key)
-        if not overwrite and await self._async_client.exists(key):
+        """Async: Store a value at a key."""
+        full_key = self._key(key)
+        if not overwrite and await self._async_client.exists(full_key):
             raise ValueError(
-                f"Cache key '{key}' already exists. Use overwrite=True to replace."
+                f"Key '{full_key}' already exists. Use overwrite=True to replace."
             )
         serialized = self._serialize(value)
-        await self._async_client.set(key, serialized)
-        await self._apply_ttl_async(key, ttl)
+        await self._async_client.set(full_key, serialized)
+        await self._apply_ttl_async(full_key, ttl)
         return True
 
-    async def async_retrieve(
-        self, cache_key: str, default: Any = None
+    async def async_get(
+        self, key: str, default: Any = None
     ) -> Any:
-        """Async: Retrieve a cached value."""
-        key = self._key(cache_key)
-        raw = await self._async_client.get(key)
+        """Async: Retrieve a stored value."""
+        full_key = self._key(key)
+        raw = await self._async_client.get(full_key)
         if raw is None:
             return default
         return self._deserialize(raw)
 
     async def async_upsert(
         self,
-        cache_key: str,
+        key: str,
         value: Any,
         ttl: Optional[int] = None,
     ) -> bool:
-        """Async: Store or update a cached value."""
-        key = self._key(cache_key)
+        """Async: Store or update a value at a key."""
+        full_key = self._key(key)
         serialized = self._serialize(value)
-        await self._async_client.set(key, serialized)
-        await self._apply_ttl_async(key, ttl)
+        await self._async_client.set(full_key, serialized)
+        await self._apply_ttl_async(full_key, ttl)
         return True
 
     async def async_increment(
         self,
-        cache_key: str,
+        key: str,
         amount: Union[int, float] = 1,
         ttl: Optional[int] = None,
     ) -> Union[int, float]:
-        """Async: Non-atomic increment stored numeric value."""
-        current = await self.async_retrieve(cache_key)
+        """Async: Non-atomic increment of a stored numeric value."""
+        current = await self.async_get(key)
         new_val = (current if current is not None else 0) + amount
-        await self.async_upsert(cache_key, new_val, ttl=ttl)
+        await self.async_upsert(key, new_val, ttl=ttl)
         return new_val
 
     async def async_decrement(
         self,
-        cache_key: str,
+        key: str,
         amount: Union[int, float] = 1,
         ttl: Optional[int] = None,
     ) -> Union[int, float]:
-        """Async: Non-atomic decrement stored numeric value."""
-        return await self.async_increment(cache_key, -amount, ttl=ttl)
+        """Async: Non-atomic decrement of a stored numeric value."""
+        return await self.async_increment(key, -amount, ttl=ttl)
 
-    async def async_delete(self, *cache_keys: str) -> int:
-        """Async: Delete one or more cached entries."""
-        if not cache_keys:
+    async def async_delete(self, *keys: str) -> int:
+        """Async: Delete one or more stored entries."""
+        if not keys:
             return 0
-        full_keys = [self._key(k) for k in cache_keys]
+        full_keys = [self._key(k) for k in keys]
         return int(await self._async_client.delete(*full_keys))
 
-    async def async_exists(self, cache_key: str) -> bool:
-        """Async: Check if a cache key exists."""
-        return bool(await self._async_client.exists(self._key(cache_key)))
+    async def async_exists(self, key: str) -> bool:
+        """Async: Check if a key exists."""
+        return bool(await self._async_client.exists(self._key(key)))
+
+    async def async_set_if_not_exists(
+        self,
+        key: str,
+        value: Any,
+        ttl: Optional[int] = None,
+    ) -> bool:
+        """Async: Store a value only if the key does not exist (atomic)."""
+        full_key = self._key(key)
+        serialized = self._serialize(value)
+        effective_ttl = ttl if ttl is not None else self.default_ttl
+        if effective_ttl is not None and effective_ttl > 0:
+            result = await self._async_client.set(
+                full_key, serialized, nx=True, ex=effective_ttl
+            )
+        else:
+            result = await self._async_client.set(full_key, serialized, nx=True)
+        return bool(result)
 
     async def async_get_or_set(
         self,
-        cache_key: str,
+        key: str,
         factory: Union[Callable[[], Any], Any],
         ttl: Optional[int] = None,
     ) -> Any:
-        """Async: Cache-aside pattern — retrieve or compute and cache."""
-        existing = await self.async_retrieve(cache_key)
+        """Async: Retrieve a value, or compute and store a new one."""
+        existing = await self.async_get(key)
         if existing is not None:
             return existing
         value = factory() if callable(factory) else factory
-        await self.async_upsert(cache_key, value, ttl=ttl)
+        await self.async_upsert(key, value, ttl=ttl)
         return value
 
-    async def async_bulk_retrieve(
-        self, cache_keys: List[str], default: Any = None
+    async def async_bulk_get(
+        self, keys: List[str], default: Any = None
     ) -> Dict[str, Any]:
-        """Async: Retrieve multiple cached values using pipeline."""
-        if not cache_keys:
+        """Async: Retrieve multiple stored values in a pipeline."""
+        if not keys:
             return {}
         pipe = self._async_client.pipeline(transaction=False)
-        for cache_key in cache_keys:
-            pipe.get(self._key(cache_key))
+        for key in keys:
+            pipe.get(self._key(key))
         results = await pipe.execute()
         output: Dict[str, Any] = {}
-        for cache_key, raw in zip(cache_keys, results):
-            output[cache_key] = self._deserialize(raw) if raw is not None else default
+        for key, raw in zip(keys, results):
+            output[key] = self._deserialize(raw) if raw is not None else default
         return output
 
-    async def async_bulk_store(
+    async def async_bulk_set(
         self,
         entries: Dict[str, Any],
         ttl: Optional[int] = None,
         overwrite: bool = False,
     ) -> int:
-        """Async: Store multiple values using pipeline."""
+        """Async: Store multiple values in a pipeline."""
         if not entries:
             return 0
         pipe = self._async_client.pipeline(transaction=False)
         stored = 0
-        for cache_key, value in entries.items():
-            key = self._key(cache_key)
-            if not overwrite and await self._async_client.exists(key):
+        for key, value in entries.items():
+            full_key = self._key(key)
+            if not overwrite and await self._async_client.exists(full_key):
                 continue
             serialized = self._serialize(value)
-            pipe.set(key, serialized)
+            pipe.set(full_key, serialized)
             stored += 1
         await pipe.execute()
         if stored > 0:
             effective_ttl = ttl if ttl is not None else self.default_ttl
             if effective_ttl is not None and effective_ttl > 0:
                 ttl_pipe = self._async_client.pipeline(transaction=False)
-                for cache_key in entries:
-                    ttl_pipe.expire(self._key(cache_key), effective_ttl)
+                for key in entries:
+                    ttl_pipe.expire(self._key(key), effective_ttl)
                 await ttl_pipe.execute()
         return stored
 
-    async def async_invalidate_pattern(
+    async def async_delete_pattern(
         self, pattern: str, batch_size: int = 1000
     ) -> int:
-        """Async: Delete all cache entries matching a pattern."""
+        """Async: Delete all entries matching a pattern."""
         search = f"{self.prefix}:{pattern}"
         deleted = 0
         cursor = 0
@@ -2564,7 +2650,7 @@ class RedisCacheManager:
     async def async_count(
         self, pattern: Optional[str] = None, batch_size: int = 1000
     ) -> int:
-        """Async: Count cache entries under this prefix."""
+        """Async: Count entries under this prefix."""
         search = f"{self.prefix}:{pattern}*" if pattern else f"{self.prefix}:*"
         count = 0
         cursor = 0
@@ -2577,16 +2663,16 @@ class RedisCacheManager:
                 break
         return count
 
-    async def async_flush_all(self, batch_size: int = 1000) -> int:
-        """Async: Delete ALL cache entries under this prefix."""
-        return await self.async_invalidate_pattern("*", batch_size=batch_size)
+    async def async_delete_all(self, batch_size: int = 1000) -> int:
+        """Async: Delete ALL entries under this prefix."""
+        return await self.async_delete_pattern("*", batch_size=batch_size)
 
     async def async_close(self) -> None:
-        """Close async Redis connection."""
+        """Close the async Redis connection."""
         await self._async_client.aclose()
 
     def close(self) -> None:
-        """Close sync Redis connection."""
+        """Close the sync Redis connection."""
         self._sync_client.close()
 
     # ──────────────────────────────────────────────
@@ -2594,13 +2680,480 @@ class RedisCacheManager:
     # ──────────────────────────────────────────────
 
     def __repr__(self) -> str:
-        """String representation of RedisCacheManager."""
+        """String representation of RedisStringUtil."""
         return (
-            f"RedisCacheManager(url='{self.url}', prefix='{self.prefix}', "
+            f"RedisStringUtil(url='{self.url}', prefix='{self.prefix}', "
             f"default_ttl={self.default_ttl})"
         )
 
-    def __enter__(self) -> "RedisCacheManager":
+    def __enter__(self) -> "RedisStringUtil":
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Context manager exit — close connections."""
+        self.close()
+
+
+# ══════════════════════════════════════════════
+# REDIS CACHE — CACHING LAYER ON STRING STORAGE
+# ══════════════════════════════════════════════
+
+
+class RedisCache:
+    """
+    Production-ready caching layer built on top of ``RedisStringUtil``.
+
+    A thin, focused wrapper that instantiates ``RedisStringUtil`` with a
+    dedicated ``CACHE`` namespace so every cached entry lives under
+    ``CACHE:<key>``. Provides cache-centric operations: set, get, delete,
+    exists, count, TTL management, cache-aside, atomic claims, and bulk ops.
+
+    The namespace is always applied internally — callers may pass a bare
+    key (``"user:123"``) or a fully-qualified key (``"CACHE:user:123"``);
+    both resolve to the same entry.
+
+    Attributes:
+        url (str): Redis connection URL.
+        prefix (str): Cache namespace. Defaults to "CACHE".
+        default_ttl (Optional[int]): Default TTL in seconds. None = permanent.
+
+    Example:
+        >>> cache = RedisCache(default_ttl=600)
+        >>> cache.set("user:123", {"name": "Alice"}, ttl=300)
+        >>> cache.get("user:123")
+        {"name": "Alice"}
+        >>> cache.get("CACHE:user:123")
+        {"name": "Alice"}
+    """
+
+    def __init__(
+        self,
+        url: str = "redis://localhost:6379/0",
+        prefix: str = "CACHE",
+        default_ttl: Optional[int] = None,
+    ) -> None:
+        """
+        Initialize RedisCache instance.
+
+        Args:
+            url: Redis connection URL. Defaults to localhost:6379.
+            prefix: Cache namespace. Defaults to "CACHE". All keys are
+                    stored under ``{prefix}:{key}``.
+            default_ttl: Default TTL in seconds applied to entries when no
+                         explicit ``ttl`` is passed. Defaults to None (permanent).
+
+        Example:
+            >>> # Ephemeral cache — entries auto-expire after 10 min
+            >>> cache = RedisCache(default_ttl=600)
+            >>> # Persistent cache — entries live forever
+            >>> cache = RedisCache(prefix="CONFIG", default_ttl=None)
+
+        Raises:
+            ValueError: If the Redis URL is invalid or has an unsupported scheme.
+            ConnectionError: If the Redis server cannot be reached.
+        """
+        validate_redis_connection(url)
+        self.url: str = url
+        self.prefix: str = prefix.upper()
+        self.default_ttl: Optional[int] = default_ttl
+        self._store: RedisStringUtil = RedisStringUtil(
+            url=self.url,
+            prefix=self.prefix,
+            default_ttl=self.default_ttl,
+            _skip_validation=True,
+        )
+
+    def _normalize_key(self, key: str) -> str:
+        """Strip the namespace prefix from a key if already present."""
+        namespace = f"{self.prefix}:"
+        return key[len(namespace):] if key.startswith(namespace) else key
+
+    # ──────────────────────────────────────────────
+    # CORE OPERATIONS
+    # ──────────────────────────────────────────────
+
+    def set(
+        self,
+        key: str,
+        value: Any,
+        ttl: Optional[int] = None,
+        overwrite: bool = True,
+    ) -> bool:
+        """
+        Store a value in the cache under ``{prefix}:{key}``.
+
+        Args:
+            key: Cache key. May be bare (``"user:123"``) or already
+                 prefixed (``"CACHE:user:123"``).
+            value: Value to store. JSON-serialized automatically.
+            ttl: TTL in seconds. Overrides ``default_ttl`` if provided.
+            overwrite: If False, a ``ValueError`` is raised when the key
+                       already exists. Defaults to True (cache semantics).
+
+        Returns:
+            True if the value was stored.
+
+        Raises:
+            ValueError: If the key exists and ``overwrite=False``.
+
+        Example:
+            >>> cache.set("session:abc", {"token": "xyz"}, ttl=300)
+            True
+        """
+        bare = self._normalize_key(key)
+        self._store.set(bare, value, ttl=ttl, overwrite=overwrite)
+        return True
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """
+        Retrieve a cached value by key.
+
+        Args:
+            key: Cache key. Accepts ``"user:123"`` or ``"CACHE:user:123"``.
+            default: Value returned when the key is missing.
+
+        Returns:
+            The cached value (deserialized), or ``default``.
+
+        Example:
+            >>> cache.get("user:123")
+            {"name": "Alice"}
+            >>> cache.get("user:999", default=None)
+            None
+        """
+        bare = self._normalize_key(key)
+        return self._store.get(bare, default=default)
+
+    def delete(self, *keys: str) -> int:
+        """
+        Delete one or more cached entries.
+
+        Args:
+            *keys: Cache keys. Accepts bare or prefixed forms.
+
+        Returns:
+            Number of keys actually deleted.
+
+        Example:
+            >>> cache.delete("user:123", "CACHE:user:456")
+            2
+        """
+        bare_keys = [self._normalize_key(k) for k in keys]
+        return self._store.delete(*bare_keys)
+
+    def exists(self, key: str) -> bool:
+        """
+        Check whether a cache entry exists.
+
+        Args:
+            key: Cache key. Accepts bare or prefixed forms.
+
+        Returns:
+            True if the entry exists, False otherwise.
+
+        Example:
+            >>> cache.exists("user:123")
+            True
+        """
+        bare = self._normalize_key(key)
+        return self._store.exists(bare)
+
+    # ──────────────────────────────────────────────
+    # TTL OPERATIONS
+    # ──────────────────────────────────────────────
+
+    def ttl(self, key: str) -> int:
+        """
+        Get the remaining TTL of a cache entry.
+
+        Args:
+            key: Cache key. Accepts bare or prefixed forms.
+
+        Returns:
+            Remaining seconds, -1 if no expiry, -2 if the key does not exist.
+
+        Example:
+            >>> cache.ttl("session:abc")
+            5400
+        """
+        bare = self._normalize_key(key)
+        return self._store.ttl(bare)
+
+    def expire(self, key: str, seconds: int) -> bool:
+        """
+        Update the TTL of an existing cache entry.
+
+        Args:
+            key: Cache key. Accepts bare or prefixed forms.
+            seconds: New TTL in seconds.
+
+        Returns:
+            True if the TTL was set, False if the key does not exist.
+
+        Example:
+            >>> cache.expire("user:123", 7200)
+            True
+        """
+        bare = self._normalize_key(key)
+        return self._store.expire(bare, seconds)
+
+    def persist(self, key: str) -> bool:
+        """
+        Remove the TTL from a cache entry (make it permanent).
+
+        Args:
+            key: Cache key. Accepts bare or prefixed forms.
+
+        Returns:
+            True if the TTL was removed, False otherwise.
+
+        Example:
+            >>> cache.persist("config:feature_x")
+            True
+        """
+        bare = self._normalize_key(key)
+        return self._store.persist(bare)
+
+    # ──────────────────────────────────────────────
+    # CACHE-SPECIFIC PATTERNS
+    # ──────────────────────────────────────────────
+
+    def get_or_set(
+        self,
+        key: str,
+        factory: Union[Callable[[], Any], Any],
+        ttl: Optional[int] = None,
+    ) -> Any:
+        """
+        Cache-aside (lazy-loading) pattern: return the cached value, or
+        compute/store and return a new one.
+
+        Args:
+            key: Cache key. Accepts bare or prefixed forms.
+            factory: Callable producing the value on a miss, or a static value.
+            ttl: TTL in seconds for the new entry. Overrides ``default_ttl``.
+
+        Returns:
+            The cached or freshly computed value.
+
+        Example:
+            >>> cache.get_or_set("user:123", lambda: db.query(123), ttl=300)
+            {"name": "Alice"}
+        """
+        existing = self.get(key)
+        if existing is not None:
+            return existing
+        value = factory() if callable(factory) else factory
+        self.set(key, value, ttl=ttl)
+        return value
+
+    def set_if_not_exists(
+        self, key: str, value: Any, ttl: Optional[int] = None
+    ) -> bool:
+        """
+        Atomically store a value only if the key is absent (SET NX).
+
+        Useful for distributed "first-write-wins" claims.
+
+        Args:
+            key: Cache key. Accepts bare or prefixed forms.
+            value: Value to store.
+            ttl: TTL in seconds. Overrides ``default_ttl``.
+
+        Returns:
+            True if the value was stored, False if the key already exists.
+
+        Example:
+            >>> cache.set_if_not_exists("lock:job:1", "worker-a")
+            True
+            >>> cache.set_if_not_exists("lock:job:1", "worker-b")
+            False
+        """
+        bare = self._normalize_key(key)
+        return self._store.set_if_not_exists(bare, value, ttl=ttl)
+
+    # ──────────────────────────────────────────────
+    # BULK OPERATIONS
+    # ──────────────────────────────────────────────
+
+    def bulk_set(
+        self,
+        entries: Dict[str, Any],
+        ttl: Optional[int] = None,
+        overwrite: bool = True,
+    ) -> int:
+        """
+        Store multiple cache entries in a pipeline.
+
+        Args:
+            entries: Dict mapping keys to values. Keys may be bare or prefixed.
+            ttl: TTL in seconds. Overrides ``default_ttl``.
+            overwrite: If False, existing keys are skipped.
+
+        Returns:
+            Number of entries stored.
+
+        Example:
+            >>> cache.bulk_set({"item:1": {"qty": 5}, "item:2": {"qty": 3}}, ttl=120)
+            2
+        """
+        normalized = {self._normalize_key(k): v for k, v in entries.items()}
+        return self._store.bulk_set(normalized, ttl=ttl, overwrite=overwrite)
+
+    def bulk_get(
+        self, keys: List[str], default: Any = None
+    ) -> Dict[str, Any]:
+        """
+        Retrieve multiple cache entries in a pipeline.
+
+        Args:
+            keys: List of cache keys. Accepts bare or prefixed forms.
+            default: Value returned for missing keys.
+
+        Returns:
+            Dict mapping keys to their values.
+
+        Example:
+            >>> cache.bulk_get(["k1", "k2", "missing"])
+            {"k1": [1, 2], "k2": {"a": 1}, "missing": None}
+        """
+        normalized = [self._normalize_key(k) for k in keys]
+        return self._store.bulk_get(normalized, default=default)
+
+    def bulk_delete(self, keys: List[str]) -> int:
+        """
+        Delete multiple cache entries in a pipeline.
+
+        Args:
+            keys: List of cache keys. Accepts bare or prefixed forms.
+
+        Returns:
+            Number of keys actually deleted.
+
+        Example:
+            >>> cache.bulk_delete(["k1", "k2", "k3"])
+            3
+        """
+        normalized = [self._normalize_key(k) for k in keys]
+        return self._store.bulk_delete(normalized)
+
+    # ──────────────────────────────────────────────
+    # INSPECTION & INVALIDATION
+    # ──────────────────────────────────────────────
+
+    def count(self, pattern: Optional[str] = None, batch_size: int = 1000) -> int:
+        """
+        Count cache entries under the namespace.
+
+        Args:
+            pattern: Optional sub-pattern to match.
+            batch_size: SCAN batch size.
+
+        Returns:
+            Number of matching entries.
+
+        Example:
+            >>> cache.count()
+            256
+            >>> cache.count(pattern="user:*")
+            42
+        """
+        return self._store.count(pattern=pattern, batch_size=batch_size)
+
+    def list_keys(
+        self,
+        pattern: Optional[str] = None,
+        offset: int = 0,
+        limit: int = 0,
+        batch_size: int = 1000,
+    ) -> List[str]:
+        """
+        List cache keys under the namespace with pagination.
+
+        Args:
+            pattern: Optional sub-pattern to match.
+            offset: Number of keys to skip.
+            limit: Maximum keys to return. 0 = no limit.
+            batch_size: SCAN batch size.
+
+        Returns:
+            List of bare keys (without the namespace prefix).
+
+        Example:
+            >>> cache.list_keys(pattern="user:*", limit=10)
+            ["user:123", "user:456", ...]
+        """
+        return self._store.list_keys(
+            pattern=pattern, offset=offset, limit=limit, batch_size=batch_size
+        )
+
+    def invalidate(self, pattern: str, batch_size: int = 1000) -> int:
+        """
+        Delete all cache entries matching a glob pattern.
+
+        Args:
+            pattern: Glob pattern (e.g., ``"user:*"``).
+            batch_size: SCAN batch size.
+
+        Returns:
+            Number of entries deleted.
+
+        Example:
+            >>> cache.invalidate("session:*")
+            42
+        """
+        return self._store.delete_pattern(pattern, batch_size=batch_size)
+
+    def invalidate_namespace(self, namespace: str, batch_size: int = 1000) -> int:
+        """
+        Delete all cache entries under a sub-namespace.
+
+        Args:
+            namespace: Sub-namespace (e.g., "session" clears ``CACHE:session:*``).
+            batch_size: SCAN batch size.
+
+        Returns:
+            Number of entries deleted.
+
+        Example:
+            >>> cache.invalidate_namespace("session")
+            150
+        """
+        return self._store.delete_namespace(namespace, batch_size=batch_size)
+
+    def flush(self, batch_size: int = 1000) -> int:
+        """
+        Delete ALL cache entries under this namespace (dangerous).
+
+        Args:
+            batch_size: SCAN batch size.
+
+        Returns:
+            Number of entries deleted.
+
+        Example:
+            >>> cache.flush()
+            1024
+        """
+        return self._store.delete_all(batch_size=batch_size)
+
+    def close(self) -> None:
+        """Close the sync Redis connection."""
+        self._store.close()
+
+    # ──────────────────────────────────────────────
+    # DUNDER METHODS
+    # ──────────────────────────────────────────────
+
+    def __repr__(self) -> str:
+        """String representation of RedisCache."""
+        return (
+            f"RedisCache(url='{self.url}', prefix='{self.prefix}', "
+            f"default_ttl={self.default_ttl})"
+        )
+
+    def __enter__(self) -> "RedisCache":
         """Context manager entry."""
         return self
 
@@ -2733,14 +3286,16 @@ def example_redis_hash_util() -> None:
     print("Done!\n")
 
 
-def example_redis_cache_manager() -> None:
-    """Demonstrate RedisCacheManager — string-based caching layer."""
+
+
+def example_redis_string_util() -> None:
+    """Demonstrate RedisStringUtil — string-based storage."""
 
     print("=" * 60)
-    print("RedisCacheManager — Usage Examples")
+    print("RedisStringUtil — Usage Examples")
     print("=" * 60)
 
-    cache = RedisCacheManager(
+    store = RedisStringUtil(
         url="redis://localhost:6379/0",
         prefix="API:USERS",
         default_ttl=600,  # optional — entries auto-expire after 10 min
@@ -2749,36 +3304,36 @@ def example_redis_cache_manager() -> None:
     # ── BASIC CRUD ────────────────────────────
 
     print("\n--- Basic CRUD ---")
-    cache.flush_all()
+    store.delete_all()
 
-    # Store (raises on duplicate)
-    cache.store("user:123", {"name": "Alice", "role": "admin"}, overwrite=True)
-    print(f"Stored user:123")
+    # set (raises on duplicate)
+    store.set("user:123", {"name": "Alice", "role": "admin"}, overwrite=True)
+    print("Stored user:123")
 
-    # Retrieve (deserializes JSON automatically)
-    user = cache.retrieve("user:123")
+    # get (deserializes JSON automatically)
+    user = store.get("user:123")
     print(f"Retrieved:   {user}")
 
-    # Retrieve with default
-    missing = cache.retrieve("user:999", default={"name": "Nobody"})
+    # get with default
+    missing = store.get("user:999", default={"name": "Nobody"})
     print(f"Missing key: {missing}")
 
-    # Upsert (silent overwrite)
-    cache.upsert("user:123", {"name": "Alice", "role": "superadmin"})
-    print(f"Upserted:    {cache.retrieve('user:123')}")
+    # upsert (silent overwrite)
+    store.upsert("user:123", {"name": "Alice", "role": "superadmin"})
+    print(f"Upserted:    {store.get('user:123')}")
 
-    # Exists
-    print(f"Exists:      {cache.exists('user:123')}")
-    print(f"Missing:     {cache.exists('user:999')}")
+    # exists
+    print(f"Exists:      {store.exists('user:123')}")
+    print(f"Missing:     {store.exists('user:999')}")
 
-    # Delete
-    cache.store("temp:key", "ephemeral", overwrite=True)
-    cache.delete("temp:key")
-    print(f"Deleted temp:key — exists: {cache.exists('temp:key')}")
+    # delete
+    store.set("temp:key", "ephemeral", overwrite=True)
+    store.delete("temp:key")
+    print(f"Deleted temp:key — exists: {store.exists('temp:key')}")
 
-    # ── CACHE-ASIDE PATTERN ───────────────────
+    # ── GET OR SET ────────────────────────────
 
-    print("\n--- get_or_set (Cache-Aside) ---")
+    print("\n--- get_or_set ---")
 
     call_count = 0
 
@@ -2788,83 +3343,83 @@ def example_redis_cache_manager() -> None:
         call_count += 1
         return {"name": f"User_{user_id}", "computed_at": time.time()}
 
-    # First call — cache miss, calls factory
-    result = cache.get_or_set("user:456", lambda: expensive_query("456"), ttl=300)
+    # First call — miss, calls factory
+    result = store.get_or_set("user:456", lambda: expensive_query("456"), ttl=300)
     print(f"First call:  {result}  (factory calls: {call_count})")
 
-    # Second call — cache hit, factory NOT called
-    result = cache.get_or_set("user:456", lambda: expensive_query("456"), ttl=300)
+    # Second call — hit, factory NOT called
+    result = store.get_or_set("user:456", lambda: expensive_query("456"), ttl=300)
     print(f"Second call: {result}  (factory calls: {call_count})")
 
     # With static default
-    config = cache.get_or_set("config:features", {"dark_mode": True, "beta": False})
+    config = store.get_or_set("config:features", {"dark_mode": True, "beta": False})
     print(f"Config:      {config}")
 
     # ── TTL OPERATIONS ────────────────────────
 
     print("\n--- TTL Operations ---")
-    cache.store("ttl:test", "expires_soon", ttl=30)
-    print(f"TTL remaining: {cache.ttl('ttl:test')}s")
+    store.set("ttl:test", "expires_soon", ttl=30)
+    print(f"TTL remaining: {store.ttl('ttl:test')}s")
 
-    cache.expire("ttl:test", 3600)
-    print(f"After expire:  {cache.ttl('ttl:test')}s")
+    store.expire("ttl:test", 3600)
+    print(f"After expire:  {store.ttl('ttl:test')}s")
 
-    cache.persist("ttl:test")
-    print(f"After persist: {cache.ttl('ttl:test')} (-1 = permanent)")
+    store.persist("ttl:test")
+    print(f"After persist: {store.ttl('ttl:test')} (-1 = permanent)")
 
     # ── BULK OPERATIONS ───────────────────────
 
     print("\n--- Bulk Operations ---")
-    cache.bulk_store({
+    store.bulk_set({
         "bulk:1": {"item": "apple", "qty": 5},
         "bulk:2": {"item": "banana", "qty": 3},
         "bulk:3": {"item": "cherry", "qty": 8},
     }, ttl=120)
 
-    bulk_data = cache.bulk_retrieve(["bulk:1", "bulk:2", "bulk:3", "bulk:missing"])
+    bulk_data = store.bulk_get(["bulk:1", "bulk:2", "bulk:3", "bulk:missing"])
     print(f"Bulk retrieved: {len(bulk_data)} keys")
     for k, v in bulk_data.items():
         print(f"  {k}: {v}")
 
-    print(f"Bulk deleted: {cache.bulk_delete(['bulk:1', 'bulk:2', 'bulk:3'])}")
+    print(f"Bulk deleted: {store.bulk_delete(['bulk:1', 'bulk:2', 'bulk:3'])}")
 
-    # ── ATOMIC STORE IF NOT EXISTS ────────────
+    # ── ATOMIC SET IF NOT EXISTS ──────────────
 
-    print("\n--- store_if_not_exists ---")
-    r1 = cache.store_if_not_exists("atomic:key", "first_writer")
-    r2 = cache.store_if_not_exists("atomic:key", "second_writer")
-    print(f"First:  {r1}  (value: {cache.retrieve('atomic:key')})")
-    print(f"Second: {r2}  (value still: {cache.retrieve('atomic:key')})")
+    print("\n--- set_if_not_exists ---")
+    r1 = store.set_if_not_exists("atomic:key", "first_writer")
+    r2 = store.set_if_not_exists("atomic:key", "second_writer")
+    print(f"First:  {r1}  (value: {store.get('atomic:key')})")
+    print(f"Second: {r2}  (value still: {store.get('atomic:key')})")
 
-    # ── NAMESPACE / PATTERN INVALIDATION ──────
+    # ── NAMESPACE / PATTERN DELETION ──────────
 
-    print("\n--- Namespace Invalidation ---")
-    cache.store("session:abc", "data1", overwrite=True)
-    cache.store("session:def", "data2", overwrite=True)
-    cache.store("user:sess1", "data3", overwrite=True)
-    print(f"Before: {cache.count()} keys")
+    print("\n--- Namespace Deletion ---")
+    store.set("session:abc", "data1", overwrite=True)
+    store.set("session:def", "data2", overwrite=True)
+    store.set("user:sess1", "data3", overwrite=True)
+    print(f"Before: {store.count()} keys")
 
-    cache.invalidate_namespace("session")
-    print(f"After invalidating 'session': {cache.count()} keys")
+    store.delete_namespace("session")
+    print(f"After deleting 'session': {store.count()} keys")
 
     # ── DECORATOR ─────────────────────────────
 
-    print("\n--- @cache_result Decorator ---")
+    print("\n--- @memoize Decorator ---")
 
-    @cache.cache_result(ttl=300, key_prefix="decorated")
+    @store.memoize(ttl=300, key_prefix="memoized")
     def get_product(product_id: str) -> dict:
         """Simulate fetching a product from DB."""
         return {"id": product_id, "name": f"Product-{product_id}", "price": 29.99}
 
     p1 = get_product("P001")
-    p2 = get_product("P001")  # served from cache
+    p2 = get_product("P001")  # served from store
     print(f"Product: {p1}")
-    print(f"Cached:  {p1 == p2}  (same object from cache)")
+    print(f"Stored:  {p1 == p2}  (same object from store)")
 
     # ── STATS ─────────────────────────────────
 
-    print("\n--- Cache Stats ---")
-    s = cache.stats()
+    print("\n--- Redis Stats ---")
+    s = store.stats()
     print(f"Total keys:     {s['total_keys']}")
     print(f"Memory:         {s['used_memory_human']}")
     print(f"Hit rate:       {s['hit_rate']}")
@@ -2872,24 +3427,103 @@ def example_redis_cache_manager() -> None:
     # ── IMPORT / EXPORT ───────────────────────
 
     print("\n--- Export / Import ---")
-    cache.export_json("/tmp/cache_backup.json")
-    print(f"Exported to /tmp/cache_backup.json")
+    store.export_json("/tmp/string_backup.json")
+    print("Exported to /tmp/string_backup.json")
 
-    imported = cache.import_json("/tmp/cache_backup.json", overwrite=True)
+    imported = store.import_json("/tmp/string_backup.json", overwrite=True)
     print(f"Imported: {imported} entries")
 
-    json_str = cache.export_json_string()
+    json_str = store.export_json_string()
     print(f"JSON string length: {len(json_str)} chars")
 
     # ── CLEANUP ───────────────────────────────
 
     print("\n--- Cleanup ---")
-    cache.flush_all()
-    print(f"Remaining keys: {cache.count()}")
+    store.delete_all()
+    print(f"Remaining keys: {store.count()}")
+    store.close()
+    print("Done!\n")
+
+
+def example_redis_cache() -> None:
+    """Demonstrate RedisCache — caching layer on RedisStringUtil."""
+
+    print("=" * 60)
+    print("RedisCache — Usage Examples")
+    print("=" * 60)
+
+    cache = RedisCache(
+        url="redis://localhost:6379/0",
+        prefix="CACHE",
+        default_ttl=None,
+    )
+
+    # ── CORE ──────────────────────────────────
+
+    print("\n--- Core CRUD ---")
+    cache.flush()
+
+    cache.set("user:123", {"name": "Alice", "role": "admin"}, ttl=300)
+    print(f"Stored user:123 under CACHE:user:123")
+
+    # get with or without the CACHE prefix
+    print(f"get('user:123'):        {cache.get('user:123')}")
+    print(f"get('CACHE:user:123'):  {cache.get('CACHE:user:123')}")
+
+    print(f"exists('user:123'):     {cache.exists('user:123')}")
+    print(f"ttl('user:123'):        {cache.ttl('user:123')}s")
+
+    cache.expire("user:123", 600)
+    print(f"After expire:           {cache.ttl('user:123')}s")
+
+    cache.delete("user:123")
+    print(f"After delete:           {cache.exists('user:123')}")
+
+    # ── CACHE PATTERNS ────────────────────────
+
+    print("\n--- Cache Patterns ---")
+
+    calls = 0
+
+    def db_query(uid: str) -> dict:
+        nonlocal calls
+        calls += 1
+        return {"id": uid, "name": f"User-{uid}"}
+
+    first = cache.get_or_set("profile:42", lambda: db_query("42"), ttl=120)
+    second = cache.get_or_set("profile:42", lambda: db_query("42"), ttl=120)
+    print(f"First:  {first}  (factory calls: {calls})")
+    print(f"Second: {second}  (factory calls: {calls})")
+
+    claimed = cache.set_if_not_exists("lock:job:1", "worker-a")
+    claimed_again = cache.set_if_not_exists("lock:job:1", "worker-b")
+    print(f"First claim: {claimed}   Second claim: {claimed_again}")
+
+    # ── BULK ──────────────────────────────────
+
+    print("\n--- Bulk ---")
+    cache.bulk_set({"item:1": {"qty": 5}, "item:2": {"qty": 3}}, ttl=120)
+    data = cache.bulk_get(["item:1", "item:2", "item:missing"])
+    print(f"Bulk get: {data}")
+    print(f"Bulk delete: {cache.bulk_delete(['item:1', 'item:2'])}")
+
+    # ── INVALIDATION ──────────────────────────
+
+    print("\n--- Invalidation ---")
+    cache.set("session:abc", "s1", overwrite=True)
+    cache.set("session:def", "s2", overwrite=True)
+    print(f"Count: {cache.count()}")
+    cache.invalidate_namespace("session")
+    print(f"After invalidate_namespace('session'): {cache.count()}")
+
+    # ── CLEANUP ───────────────────────────────
+
+    cache.flush()
     cache.close()
     print("Done!\n")
 
 
 if __name__ == "__main__":
     example_redis_hash_util()
-    example_redis_cache_manager()
+    example_redis_string_util()
+    example_redis_cache()

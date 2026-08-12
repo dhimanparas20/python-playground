@@ -1,6 +1,6 @@
 # Redis Utility Suite — Production-Ready Redis/Valkey for Python
 
-Two complementary classes for using Redis (Valkey) as a full-time database **and** caching layer. One file, zero boilerplate, full CRUD, async, pipelines, TTL, indexing, locking, import/export, and more.
+Three complementary classes for using Redis (Valkey) as a full-time database, a general-purpose key-value store, **and** a caching layer. One file, zero boilerplate, full CRUD, async, pipelines, TTL, indexing, locking, import/export, and more.
 
 ## Table of Contents
 
@@ -21,17 +21,25 @@ Two complementary classes for using Redis (Valkey) as a full-time database **and
   - [Secure Hashing](#secure-hashing-static-methods)
   - [ID Generation](#id-generation-static-methods)
   - [Context Manager & Async](#hash-context-manager--async)
-- [RedisCacheManager — String-Based Caching Layer](#rediscachemanager--string-based-caching-layer)
-  - [Constructor](#rediscachemanager-constructor)
-  - [CRUD Operations](#cache-crud-operations)
-  - [Cache-Aside Pattern](#cache-aside-pattern)
+- [RedisStringUtil — String-Based Key-Value Store](#redisstringutil--string-based-key-value-store)
+  - [Constructor](#redisstringutil-constructor)
+  - [CRUD Operations](#string-crud-operations)
+  - [Atomic Operations](#string-atomic-operations)
+  - [TTL Operations](#string-ttl-operations)
+  - [Bulk Operations](#string-bulk-operations)
+  - [Pattern Deletion](#string-pattern-deletion)
+  - [Inspection & Stats](#string-inspection--stats)
+  - [Import / Export](#string-import--export)
+  - [Decorator — Function Result Memoization](#decorator--function-result-memoization)
+  - [Context Manager & Async](#string-context-manager--async)
+- [RedisCache — Caching Layer on RedisStringUtil](#rediscache--caching-layer-on-redisstringutil)
+  - [Constructor](#rediscache-constructor)
+  - [Core Operations](#cache-core-operations)
   - [TTL Operations](#cache-ttl-operations)
+  - [Cache-Aside & Atomic Claims](#cache-aside--atomic-claims)
   - [Bulk Operations](#cache-bulk-operations)
-  - [Pattern Invalidation](#pattern-invalidation)
-  - [Inspection & Stats](#inspection--stats)
-  - [Import / Export](#cache-import--export)
-  - [Decorator — Function Result Caching](#decorator--function-result-caching)
-  - [Context Manager & Async](#cache-context-manager--async)
+  - [Inspection & Invalidation](#cache-inspection--invalidation)
+  - [Context Manager](#cache-context-manager)
 - [Use Cases](#use-cases)
 - [Docker Compose — Valkey with Persistence](#docker-compose--valkey-with-persistence)
 - [Production Notes](#production-notes)
@@ -42,11 +50,12 @@ Two complementary classes for using Redis (Valkey) as a full-time database **and
 
 | Need | Class | Redis Type | Why |
 |------|-------|-----------|-----|
-| Store structured data permanently | `RedisHashUtil` | HASH | Fields per entry, secondary indexes, field-level CRUD |
-| Cache API responses / computed values | `RedisCacheManager` | STRING | Simple key-value, JSON-serialized, TTL-first design |
-| Both | Use them together | — | Hash for DB, Cache for caching |
+| Store structured data (multiple fields per entity) | `RedisHashUtil` | HASH | Fields per entry, secondary indexes, field-level CRUD |
+| Store whole objects under a flat key | `RedisStringUtil` | STRING | Simple key-value, JSON-serialized, optional TTL |
+| Cache API responses / computed values | `RedisCache` | STRING | Dedicated `CACHE:` namespace, TTL-first design |
+| Both | Use them together | — | Hash for DB, String for KV, Cache for caching |
 
-**Rule of thumb:** If you need to query/filter by individual fields → `RedisHashUtil`. If you just need to store/retrieve whole objects with TTL → `RedisCacheManager`.
+**Rule of thumb:** If you need to query/filter by individual fields → `RedisHashUtil`. If you just need to store/retrieve whole objects → `RedisStringUtil`. If the data is meant to be short-lived/expiring → `RedisCache`.
 
 ---
 
@@ -69,7 +78,7 @@ A comprehensive utility for Redis **hash** operations. Each entry is a Redis HAS
 ### RedisHashUtil Constructor
 
 ```python
-from redis_hash_util import RedisHashUtil
+from redis_core_util import RedisHashUtil
 
 workers = RedisHashUtil(
     url="redis://localhost:6379/0",   # Redis/Valkey connection URL
@@ -350,26 +359,26 @@ asyncio.run(main())
 
 ---
 
-## RedisCacheManager — String-Based Caching Layer
+## RedisStringUtil — String-Based Key-Value Store
 
-A production-ready caching utility using Redis **STRING** type. Every entry is a single JSON-serialized value with automatic TTL. Designed for caching API responses, computed results, sessions, and ephemeral data.
+A general-purpose utility for Redis **STRING** operations. Each entry is a single JSON-serialized value stored under a flat key. This is the STRING counterpart to `RedisHashUtil` — use it whenever you need to store whole objects without field-level queries.
 
-**Key difference from RedisHashUtil:** Stores whole objects as JSON strings (not hash fields). TTL is core to the design. No secondary indexes or locks — caching is stateless.
+> **Type preservation:** Values are JSON-serialized on write and deserialized on read. `int`, `float`, `bool`, `None`, `str`, `list`, and `dict` values round-trip with exact Python types.
 
-### RedisCacheManager Constructor
+### RedisStringUtil Constructor
 
 ```python
-from redis_hash_util import RedisCacheManager
+from redis_core_util import RedisStringUtil
 
-# Ephemeral cache — entries auto-expire
-cache = RedisCacheManager(
+# Ephemeral store — entries auto-expire
+store = RedisStringUtil(
     url="redis://localhost:6379/0",
     prefix="API:USERS",
     default_ttl=600,       # 10 min default TTL (optional)
 )
 
-# Persistent cache — entries live forever (like RedisHashUtil)
-permanent = RedisCacheManager(
+# Persistent store — entries live forever
+permanent = RedisStringUtil(
     prefix="CONFIG",
     default_ttl=None,      # no expiry by default
 )
@@ -378,159 +387,137 @@ permanent = RedisCacheManager(
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `url` | `str` | `"redis://localhost:6379/0"` | Redis/Valkey connection URL |
-| `prefix` | `str` | `"CACHE"` | Key prefix for namespace isolation |
+| `prefix` | `str` | `"STRING"` | Key prefix for namespace isolation |
 | `default_ttl` | `Optional[int]` | `None` | Default TTL in seconds (`None` = permanent) |
 
-### Cache CRUD Operations
+### String CRUD Operations
 
 ```python
-# Store — raises ValueError if key exists (and overwrite=False)
-cache.store("user:123", {"name": "Alice", "role": "admin"}, overwrite=True)
+# Set — raises ValueError if key exists (and overwrite=False)
+store.set("user:123", {"name": "Alice", "role": "admin"}, overwrite=True)
 
-# Store with TTL override
-cache.store("session:abc", {"token": "xyz"}, ttl=300)
+# Set with TTL override
+store.set("session:abc", {"token": "xyz"}, ttl=300)
 
-# Retrieve — returns None if missing (or your default)
-user = cache.retrieve("user:123")                       # {"name": "Alice", ...}
-user = cache.retrieve("user:999", default={"name": "Nobody"})
+# Get — returns None if missing (or your default)
+user = store.get("user:123")                       # {"name": "Alice", ...}
+user = store.get("user:999", default={"name": "Nobody"})
 
 # Upsert — silent overwrite (never raises)
-cache.upsert("user:123", {"name": "Alice", "role": "superadmin"})
+store.upsert("user:123", {"name": "Alice", "role": "superadmin"})
 
 # with_ttl=True — returns (data, remaining_ttl) alongside the value
-value, remaining = cache.retrieve("user:123", with_ttl=True)
-stored, ttl = cache.store("user:456", {"x": 1}, ttl=120, with_ttl=True)
-exists, ttl = cache.exists("user:123", with_ttl=True)
+value, remaining = store.get("user:123", with_ttl=True)
+stored, ttl = store.set("user:456", {"x": 1}, ttl=120, with_ttl=True)
+exists, ttl = store.exists("user:123", with_ttl=True)
 
 # Delete one or more keys
-cache.delete("user:123")
-cache.delete("key1", "key2", "key3")
+store.delete("user:123")
+store.delete("key1", "key2", "key3")
 
 # Check existence
-cache.exists("user:123")   # True
-cache.exists("user:999")   # False
+store.exists("user:123")   # True
+store.exists("user:999")   # False
 ```
 
 ### `with_ttl=True` — Get Data and TTL in One Call
 
-On any non-bulk sync or async method (`store`, `retrieve`, `upsert`, `exists`, `store_if_not_exists`, `get_or_set`, `expire`, `persist`), pass `with_ttl=True` to receive a `(data, seconds_to_live)` tuple instead of just the data.
+On any non-bulk sync method (`set`, `get`, `upsert`, `exists`, `set_if_not_exists`, `get_or_set`, `expire`, `persist`), pass `with_ttl=True` to receive a `(data, seconds_to_live)` tuple instead of just the data.
 
 ```python
-value, ttl = cache.retrieve("user:123", with_ttl=True)
-ok, ttl = cache.store("user:456", data, ttl=300, with_ttl=True)
-ok, ttl = cache.exists("user:123", with_ttl=True)
+value, ttl = store.get("user:123", with_ttl=True)
+ok, ttl = store.set("user:456", data, ttl=300, with_ttl=True)
+ok, ttl = store.exists("user:123", with_ttl=True)
 ```
 
-### Cache-Aside Pattern
-
-The `get_or_set` method implements the standard **cache-aside (lazy-loading)** pattern.
-
-```python
-call_count = 0
-
-def expensive_db_query(user_id: str) -> dict:
-    """Simulate slow DB call."""
-    global call_count
-    call_count += 1
-    return {"name": f"User_{user_id}", "computed_at": time.time()}
-
-# First call — cache miss → calls factory → stores result → returns it
-result = cache.get_or_set("user:456", lambda: expensive_db_query("456"), ttl=300)
-# call_count = 1
-
-# Second call — cache hit → returns stored value, factory NOT called
-result = cache.get_or_set("user:456", lambda: expensive_db_query("456"), ttl=300)
-# call_count = 1 (unchanged)
-
-# With a static default value (no callable)
-config = cache.get_or_set("config:features", {"dark_mode": True, "beta": False})
-
-# with_ttl=True on get_or_set — get value and remaining TTL in one call
-value, remaining = cache.get_or_set("user:456", lambda: expensive_db_query("456"), ttl=300, with_ttl=True)
-```
-
-### Numeric Operations
+### String Atomic Operations
 
 ```python
 # Store only if key does not exist (SET NX)
-cache.store_if_not_exists("lock:job:123", "worker-1")   # True
-cache.store_if_not_exists("lock:job:123", "worker-2")   # False (already exists)
+store.set_if_not_exists("lock:job:123", "worker-1")   # True
+store.set_if_not_exists("lock:job:123", "worker-2")   # False (already exists)
+
+# Get or compute — lazy-loading pattern
+result = store.get_or_set("user:456", lambda: expensive_db_query("456"), ttl=300)
+
+# With a static default value (no callable)
+config = store.get_or_set("config:features", {"dark_mode": True, "beta": False})
 
 # Non-atomic increment / decrement (GET+SET, approximate counters)
-cache.increment("page_views:homepage")             # 1
-cache.increment("page_views:homepage", 5)           # 6
-cache.decrement("rate_limit:user:42")              # -1
-cache.decrement("rate_limit:user:42", amount=2)     # -3
+store.increment("page_views:homepage")             # 1
+store.increment("page_views:homepage", 5)           # 6
+store.decrement("rate_limit:user:42")              # -1
+store.decrement("rate_limit:user:42", amount=2)     # -3
 ```
 
-### Cache TTL Operations
+### String TTL Operations
 
 ```python
 # Set TTL on existing entry
-cache.expire("user:123", 7200)   # 2 hours
+store.expire("user:123", 7200)   # 2 hours
 
 # Check remaining TTL
-cache.ttl("user:123")   # seconds remaining (-1 = permanent, -2 = missing)
+store.ttl("user:123")   # seconds remaining (-1 = permanent, -2 = missing)
 
 # Remove TTL (make permanent)
-cache.persist("user:123")
+store.persist("user:123")
 
 # with_ttl on TTL methods — returns (bool, seconds) alongside the result
-ok, remaining = cache.expire("user:123", 3600, with_ttl=True)
-ok, ttl = cache.persist("user:123", with_ttl=True)
+ok, remaining = store.expire("user:123", 3600, with_ttl=True)
+ok, ttl = store.persist("user:123", with_ttl=True)
 
 # Bulk expire
-cache.bulk_expire(["user:123", "user:456"], 3600)
+store.bulk_expire(["user:123", "user:456"], 3600)
 ```
 
-### Cache Bulk Operations
+### String Bulk Operations
 
 All use **pipelines** for performance.
 
 ```python
-# Bulk store
-cache.bulk_store({
+# Bulk set
+store.bulk_set({
     "item:1": {"name": "apple", "qty": 5},
     "item:2": {"name": "banana", "qty": 3},
     "item:3": {"name": "cherry", "qty": 8},
 }, ttl=120)
 
-# Bulk retrieve (missing keys return None or your default)
-data = cache.bulk_retrieve(["item:1", "item:2", "item:3", "item:missing"])
+# Bulk get (missing keys return None or your default)
+data = store.bulk_get(["item:1", "item:2", "item:3", "item:missing"])
 # {"item:1": {...}, "item:2": {...}, "item:3": {...}, "item:missing": None}
 
 # Bulk delete
-cache.bulk_delete(["item:1", "item:2", "item:3"])
+store.bulk_delete(["item:1", "item:2", "item:3"])
 ```
 
-### Pattern Invalidation
+### String Pattern Deletion
 
-Invalidate groups of cache entries using glob patterns. All use **SCAN** (non-blocking).
+Delete groups of keys using glob patterns. All use **SCAN** (non-blocking).
 
 ```python
 # Delete all entries matching a pattern
-cache.invalidate_pattern("user:*")          # delete CACHE:user:123, CACHE:user:456, ...
+store.delete_pattern("user:*")          # delete STRING:user:123, STRING:user:456, ...
 
 # Delete by sub-namespace
-cache.invalidate_namespace("session")       # delete all CACHE:session:* entries
+store.delete_namespace("session")       # delete all STRING:session:* entries
 
 # Delete ALL entries under this prefix (dangerous!)
-cache.flush_all()
+store.delete_all()
 ```
 
-### Inspection & Stats
+### String Inspection & Stats
 
 ```python
 # Count entries
-cache.count()                           # total under this prefix
-cache.count(pattern="user:*")           # count matching pattern
+store.count()                           # total under this prefix
+store.count(pattern="user:*")           # count matching pattern
 
 # List keys with pagination
-keys = cache.list_keys(limit=10)
-keys = cache.list_keys(pattern="user:*", offset=0, limit=20)
+keys = store.list_keys(limit=10)
+keys = store.list_keys(pattern="user:*", offset=0, limit=20)
 
-# Cache statistics (from Redis INFO)
-stats = cache.stats()
+# Redis statistics (from Redis INFO)
+stats = store.stats()
 # {
 #     "used_memory": 1048576,
 #     "used_memory_human": "1.00M",
@@ -541,78 +528,202 @@ stats = cache.stats()
 # }
 ```
 
-### Cache Import / Export
+### String Import / Export
 
 ```python
 # JSON file
-cache.export_json("/tmp/cache_backup.json")
-cache.import_json("/tmp/cache_backup.json", overwrite=True)
+store.export_json("/tmp/backup.json")
+store.import_json("/tmp/backup.json", overwrite=True)
 
 # JSON string
-json_str = cache.export_json_string()
-cache.import_json_string(json_str, overwrite=True)
+json_str = store.export_json_string()
+store.import_json_string(json_str, overwrite=True)
 ```
 
-### Decorator — Function Result Caching
+### Decorator — Function Result Memoization
 
-Cache any function's return value automatically.
+Store any function's return value automatically.
 
 ```python
-@cache.cache_result(ttl=300)
+@store.memoize(ttl=300)
 def get_user(user_id: str) -> dict:
-    return db.query_user(user_id)   # only called on cache miss
+    return db.query_user(user_id)   # only called on a miss
 
-@cache.cache_result(ttl=60, key_prefix="api")
+@store.memoize(ttl=60, key_prefix="api")
 def fetch_products(category: str) -> list:
     return api.get_products(category)
 
 # With fallback on Redis errors
-@cache.cache_result(ttl=300, fallback=lambda func, *a, **kw: func(*a, **kw))
+@store.memoize(ttl=300, fallback=lambda func, *a, **kw: func(*a, **kw))
 def critical_query(id: str) -> dict:
     return db.query(id)
 
-# Manual cache invalidation
-get_user.cache_clear()
+# Manual invalidation
+get_user.clear()
 ```
 
-### Cache Context Manager & Async
+### String Context Manager & Async
 
 ```python
 # Context manager — auto-closes connection
-with RedisCacheManager(prefix="TEMP") as temp:
-    temp.store("key", "value")
+with RedisStringUtil(prefix="TEMP") as temp:
+    temp.set("key", "value")
     # connection closed on exit
 
 # Async
 import asyncio
 
 async def main():
-    cache = RedisCacheManager(prefix="API")
-    await cache.async_store("user:123", {"name": "Alice"})
-    data = await cache.async_retrieve("user:123")
-    await cache.async_close()
+    store = RedisStringUtil(prefix="API")
+    await store.async_set("user:123", {"name": "Alice"})
+    data = await store.async_get("user:123")
+    await store.async_close()
 
 asyncio.run(main())
 ```
 
-**Available async methods:** `async_store`, `async_retrieve`, `async_upsert`, `async_increment`, `async_decrement`, `async_delete`, `async_exists`, `async_get_or_set`, `async_bulk_store`, `async_bulk_retrieve`, `async_invalidate_pattern`, `async_count`, `async_flush_all`, `async_close`.
+**Available async methods:** `async_set`, `async_get`, `async_upsert`, `async_increment`, `async_decrement`, `async_delete`, `async_exists`, `async_set_if_not_exists`, `async_get_or_set`, `async_bulk_set`, `async_bulk_get`, `async_delete_pattern`, `async_count`, `async_delete_all`, `async_close`.
 
 ---
+
+## RedisCache — Caching Layer on RedisStringUtil
+
+A production-ready caching class that wraps `RedisStringUtil`. It instantiates the string util with a dedicated `CACHE` namespace so every cached entry lives under `CACHE:<key>`. All methods accept keys **with or without** the `CACHE` prefix — both resolve to the same entry.
+
+```python
+from redis_core_util import RedisCache
+
+cache = RedisCache(
+    url="redis://localhost:6379/0",   # Redis/Valkey connection URL
+    prefix="CACHE",                    # namespace (defaults to "CACHE")
+    default_ttl=None,                  # None = permanent, 600 = auto-expire
+)
+```
+
+### RedisCache Constructor
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `url` | `str` | `"redis://localhost:6379/0"` | Redis/Valkey connection URL |
+| `prefix` | `str` | `"CACHE"` | Cache namespace. Keys stored as `{prefix}:{key}` |
+| `default_ttl` | `Optional[int]` | `None` | Default TTL in seconds (`None` = permanent) |
+
+### Cache Core Operations
+
+```python
+# Set — stored under CACHE:<key>. overwrite=True by default (cache semantics)
+cache.set("user:123", {"name": "Alice", "role": "admin"})
+cache.set("user:123", {"name": "Alice", "role": "admin"}, ttl=300)
+
+# Get — key may be bare or fully qualified (with or without CACHE prefix)
+user = cache.get("user:123")            # {"name": "Alice", ...}
+same = cache.get("CACHE:user:123")      # same entry
+user = cache.get("user:999", default=None)
+
+# Delete — accepts bare or prefixed keys
+cache.delete("user:123")
+cache.delete("CACHE:user:123", "user:456")
+
+# Existence check
+cache.exists("user:123")   # True
+```
+
+### Cache TTL Operations
+
+```python
+# Update TTL on an existing entry
+cache.expire("user:123", 7200)   # 2 hours
+
+# Check remaining TTL
+cache.ttl("user:123")   # seconds remaining (-1 = permanent, -2 = missing)
+
+# Remove TTL (make permanent)
+cache.persist("user:123")
+```
+
+### Cache-Aside & Atomic Claims
+
+```python
+# Cache-aside (lazy-loading) pattern
+def expensive_db_query(user_id: str) -> dict:
+    """Simulate slow DB call."""
+    return {"name": f"User_{user_id}", "computed_at": time.time()}
+
+# First call — cache miss → calls factory → stores result → returns it
+result = cache.get_or_set("user:456", lambda: expensive_db_query("456"), ttl=300)
+
+# Second call — cache hit → returns stored value, factory NOT called
+result = cache.get_or_set("user:456", lambda: expensive_db_query("456"), ttl=300)
+
+# Atomic claim (SET NX) — first-write-wins
+cache.set_if_not_exists("lock:job:123", "worker-1")   # True
+cache.set_if_not_exists("lock:job:123", "worker-2")   # False
+```
+
+### Cache Bulk Operations
+
+All use **pipelines** for performance.
+
+```python
+# Bulk set
+cache.bulk_set({
+    "item:1": {"name": "apple", "qty": 5},
+    "item:2": {"name": "banana", "qty": 3},
+    "item:3": {"name": "cherry", "qty": 8},
+}, ttl=120)
+
+# Bulk get (missing keys return None or your default)
+data = cache.bulk_get(["item:1", "item:2", "item:3", "item:missing"])
+# {"item:1": {...}, "item:2": {...}, "item:3": {...}, "item:missing": None}
+
+# Bulk delete
+cache.bulk_delete(["item:1", "item:2", "item:3"])
+```
+
+### Cache Inspection & Invalidation
+
+```python
+# Count entries under the CACHE namespace
+cache.count()                           # total
+cache.count(pattern="user:*")           # count matching pattern
+
+# List keys (returned without the CACHE prefix)
+keys = cache.list_keys(pattern="user:*", limit=10)
+
+# Invalidate groups of entries (SCAN-based, non-blocking)
+cache.invalidate("user:*")              # delete CACHE:user:123, CACHE:user:456, ...
+cache.invalidate_namespace("session")   # delete all CACHE:session:* entries
+
+# Delete ALL entries under this namespace (dangerous!)
+cache.flush()
+```
+
+### Cache Context Manager
+
+`RedisCache` is **synchronous only** — all caching operations are blocking and sync.
+
+```python
+# Context manager — auto-closes connection
+with RedisCache(prefix="TEMP") as temp:
+    temp.set("key", "value")
+    # connection closed on exit
+```
+
 
 ## Use Cases
 
 | Use Case | Class | Prefix | TTL |
 |----------|-------|--------|-----|
 | User profiles (permanent DB) | `RedisHashUtil` | `USERS:PROFILES` | `None` |
-| Session tokens | `RedisCacheManager` | `SESSIONS` | `86400` (24h) |
+| Session tokens | `RedisCache` | `SESSIONS` | `86400` (24h) |
 | OTP codes | `RedisHashUtil` | `USERS:OTP` | `300` (5 min) |
-| Password reset tokens | `RedisCacheManager` | `RESET_TOKENS` | `900` (15 min) |
-| API response cache | `RedisCacheManager` | `CACHE:API` | `600` (10 min) |
+| Password reset tokens | `RedisCache` | `RESET_TOKENS` | `900` (15 min) |
+| API response cache | `RedisCache` | `CACHE:API` | `600` (10 min) |
 | Rate limiting counters | `RedisHashUtil` | `RATELIMIT:API` | — |
 | Feature flags (permanent) | `RedisHashUtil` | `FEATURES` | `None` |
 | Job queues | `RedisHashUtil` | `JOBS:PENDING` | — |
-| Computed / expensive results | `RedisCacheManager` | `COMPUTED` | `300` (5 min) |
-| Config cache (long-lived) | `RedisCacheManager` | `CONFIG` | `None` |
+| Computed / expensive results | `RedisCache` | `COMPUTED` | `300` (5 min) |
+| Config store (long-lived) | `RedisStringUtil` | `CONFIG` | `None` |
 
 ---
 
@@ -664,7 +775,7 @@ networks:
 ### Connecting with Password
 
 ```python
-from redis_hash_util import RedisHashUtil, RedisCacheManager
+from redis_core_util import RedisHashUtil, RedisStringUtil, RedisCache
 
 # Hash-based storage
 workers = RedisHashUtil(
@@ -672,10 +783,17 @@ workers = RedisHashUtil(
     prefix="USERS:WORKERS",
 )
 
-# String-based cache
-cache = RedisCacheManager(
+# String-based key-value store
+store = RedisStringUtil(
     url="redis://:supersecretpassword@localhost:6379/0",
-    prefix="API:CACHE",
+    prefix="API:CONFIG",
+    default_ttl=600,
+)
+
+# Cache layer
+cache = RedisCache(
+    url="redis://:supersecretpassword@localhost:6379/0",
+    prefix="CACHE",
     default_ttl=600,
 )
 ```
@@ -684,13 +802,13 @@ cache = RedisCacheManager(
 
 ## Production Notes
 
-### Shared Across Both Classes
+### Shared Across All Classes
 
 - All bulk operations use **pipelines** — no N+1 round trips
-- `get_all` / `delete_all` / `list_ids` / `invalidate_pattern` use **SCAN**, never KEYS (non-blocking)
+- `get_all` / `delete_all` / `list_ids` / `delete_pattern` use **SCAN**, never KEYS (non-blocking)
 - `default_ttl` applies automatically — per-call `ttl` parameter overrides it
-- Both classes support **context manager** pattern for safe connection cleanup
-- Both classes support full **async** with `asyncio`
+- All classes support **context manager** pattern for safe connection cleanup
+- `RedisHashUtil` and `RedisStringUtil` support full **async** with `asyncio`; `RedisCache` is synchronous-only
 - All methods have **type hints** and **docstrings**
 - Prefix is **uppercased** automatically for consistency
 
@@ -702,12 +820,22 @@ cache = RedisCacheManager(
 - Distributed locks use Redis **LOCK** with configurable timeout/blocking
 - Supports both **JSON** and **CSV** import/export
 
-### RedisCacheManager Specific
+### RedisStringUtil Specific
 
 - All values are **JSON-serialized** on write, **deserialized** on read
 - `default_ttl=None` means permanent — same behavior as `RedisHashUtil`
-- `store_if_not_exists` uses atomic **SET NX** — safe for distributed claim patterns
-- `get_or_set` implements **cache-aside (lazy-loading)** pattern
-- `@cache_result` decorator caches function return values with automatic key generation
-- Long cache keys (>128 chars) are **SHA-256 hashed** to stay within Redis limits
+- `set_if_not_exists` uses atomic **SET NX** — safe for distributed claim patterns
+- `get_or_set` implements lazy-loading of computed values
+- `@memoize` decorator stores function return values with automatic key generation
+- Long keys (>128 chars) are **SHA-256 hashed** to stay within Redis limits
 - `stats()` returns **hit rate**, memory usage, and key counts from Redis `INFO`
+
+### RedisCache Specific
+
+- Thin wrapper over `RedisStringUtil` — every entry lives under a dedicated `CACHE` namespace
+- Keys are accepted **with or without** the namespace prefix (both resolve to the same entry)
+- `set` defaults to silent overwrite (`overwrite=True`) — natural cache semantics
+- `get_or_set` implements the **cache-aside (lazy-loading)** pattern
+- `set_if_not_exists` uses atomic **SET NX** for distributed claim patterns
+- `invalidate` / `invalidate_namespace` / `flush` provide SCAN-based group invalidation
+- Synchronous-only (no async methods) — cache operations are intentionally simple

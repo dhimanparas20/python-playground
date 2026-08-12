@@ -170,7 +170,7 @@ Each module has its own comprehensive README with full API docs.
 | `RabbitMQQueue_play.py` | [modules/RABBITMQ_README.md](modules/RABBITMQ_README.md) | RabbitMQ queue handler: produce/consume/batch, exchange binding, auto-reconnect, context manager |
 | `datetime_parser/` | [modules/datetime_parser/DATETIME_PARSER_README.md](modules/datetime_parser/DATETIME_PARSER_README.md) | Datetime parsing/conversion with 100+ timezone aliases: `convert_datetime`, `timestamp_to_string`, `string_to_timestamp`, `format_iso`, `resolve_timezone`, `list_supported_timezones` |
 | `MongoDB/mongo_util.py` | [modules/MongoDB/MONGO_UTIL_README.md](modules/MongoDB/MONGO_UTIL_README.md) | Full MongoDB utility: CRUD, bulk ops, TTL, indexes, search, JSON/CSV import/export, dedup, secure hashing, admin operations |
-| `Redis/` | [modules/Redis/REDIS_UTIL_README.md](modules/Redis/REDIS_UTIL_README.md) | `RedisHashUtil` (hash storage, CRUD, bulk, TTL, locks, indexes, async) + `RedisCacheManager` (string cache, cache-aside, `@cache_result` decorator, async) |
+| `Redis/` | [modules/Redis/REDIS_UTIL_README.md](modules/Redis/REDIS_UTIL_README.md) | `RedisHashUtil` (hash storage, CRUD, bulk, TTL, locks, indexes, async) + `RedisStringUtil` (string KV store, memoize, async) + `RedisCache` (cache layer on string util, cache-aside, TTL, async) |
 | `s3/` | [modules/s3/S3_UTIL_README.md](modules/s3/S3_UTIL_README.md) | `S3Util`: upload, download, delete, list, fetch, metadata, existence checks. Backward-compatible wrappers for all operations |
 
 ---
@@ -214,7 +214,7 @@ All managed via `pyproject.toml` — install with `uv sync`.
 | Manage EMQX MQTT broker (REST API) | `modules/EMXQ_MQTT.py` |
 | Produce/consume RabbitMQ queues | `modules/RabbitMQQueue_play.py` |
 | CRUD on MongoDB (with bulk, TTL, indexes) | `modules/MongoDB/mongo_util.py` |
-| Hash-based Redis storage + string caching | `modules/Redis/redis_core_util.py` |
+| Flat Redis storage + caching (hash/string/cache) | `modules/Redis/redis_core_util.py` |
 | Upload/download files to S3 | `modules/s3/s3_util.py` |
 | Structured JSON logging with tracing | `modules/logger.py` |
 | Parse/convert datetimes across 100+ timezones | `modules/datetime_parser/` |

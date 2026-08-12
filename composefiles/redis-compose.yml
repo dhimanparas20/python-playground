@@ -1,0 +1,21 @@
+services:
+  redis-stack:
+    image: redis/redis-stack:latest
+    container_name: redis-stack
+    restart: always
+    ports:
+      - "6379:6379"
+      # WARNING: If this is a public server, do NOT expose 8001 to the public. 
+      # Bind it to localhost instead: - "127.0.0.1:8001:8001"
+      - "8001:8001"
+    environment:
+      - REDIS_ARGS=--requirepass madre_pass --appendonly yes --appendfsync everysec --no-appendfsync-on-rewrite yes --auto-aof-rewrite-percentage 100 --auto-aof-rewrite-min-size 64mb --maxmemory 2gb --maxmemory-policy volatile-lru --save 900 1 --save 300 10 --save 60 10000
+      - RI_ACCEPT_TERMS_AND_CONDITIONS=true
+    volumes:
+      - redis-data:/data
+    # System level tuning for production workloads
+    sysctls:
+      - net.core.somaxconn=511
+
+volumes:
+  redis-data:
