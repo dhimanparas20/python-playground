@@ -1,3 +1,4 @@
+# REDIS_URL=redis://:madre_pass@redis-stack:6379 or redis://:madre_pass@localhost:6379
 services:
   redis-stack:
     image: redis/redis-stack:latest
