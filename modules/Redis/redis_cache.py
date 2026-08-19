@@ -14,6 +14,8 @@ Production behavior:
     - ``None`` is a cacheable value (``lookup`` / ``get_or_set``)
     - Stampede protection (in-process singleflight + Redis SET NX lock)
     - Per-key locks on set/delete so L1 and Redis stay consistent
+    - Fail-open on Redis loss: short timeouts, circuit breaker, L1 degraded
+      mode, stale-if-error. Locks (``set_if_not_exists``) stay fail-closed.
     - Hit/miss/error metrics
 """
 
@@ -104,7 +106,31 @@ _METRIC_KEYS = (
     "stampede_locks_acquired",
     "stampede_waited",
     "stampede_lock_timeouts",
+    "fail_open_gets",
+    "fail_open_sets",
+    "fail_open_deletes",
+    "stale_serves",
+    "circuit_skipped",
+    "invalidation_failed",
+    "lock_denied",
 )
+
+
+def validate_redis_url(url: str) -> None:
+    """Validate Redis/Valkey URL structure without contacting the server."""
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("Redis connection URL cannot be empty.")
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError as exc:
+        raise ValueError(f"Malformed Redis connection URL: {url!r}") from exc
+    if parsed.scheme not in _REDIS_URL_SCHEMES:
+        raise ValueError(
+            f"Unsupported Redis URL scheme {parsed.scheme!r} in {url!r}. "
+            f"Expected one of: {', '.join(_REDIS_URL_SCHEMES)}."
+        )
+    if parsed.scheme != "unix" and not parsed.hostname:
+        raise ValueError(f"Redis connection URL is missing a host: {url!r}")
 
 
 def validate_redis_connection(url: str, timeout: float = 5.0) -> None:
@@ -125,20 +151,7 @@ def validate_redis_connection(url: str, timeout: float = 5.0) -> None:
         ConnectionError: If the Redis server cannot be reached or does not
             respond to ``PING``.
     """
-    if not isinstance(url, str) or not url.strip():
-        raise ValueError("Redis connection URL cannot be empty.")
-    try:
-        parsed = urllib.parse.urlparse(url)
-    except ValueError as exc:
-        raise ValueError(f"Malformed Redis connection URL: {url!r}") from exc
-    if parsed.scheme not in _REDIS_URL_SCHEMES:
-        raise ValueError(
-            f"Unsupported Redis URL scheme {parsed.scheme!r} in {url!r}. "
-            f"Expected one of: {', '.join(_REDIS_URL_SCHEMES)}."
-        )
-    if parsed.scheme != "unix" and not parsed.hostname:
-        raise ValueError(f"Redis connection URL is missing a host: {url!r}")
-
+    validate_redis_url(url)
     probe = redis.Redis.from_url(
         url,
         decode_responses=True,
@@ -153,56 +166,147 @@ def validate_redis_connection(url: str, timeout: float = 5.0) -> None:
         probe.close()
 
 
-class _L1Cache:
-    """Thread-safe in-process LRU with per-entry TTL. Stores ``None`` as a hit."""
+class _RedisUnavailable(Exception):
+    """Internal: Redis was skipped (circuit open) or the call failed."""
 
-    def __init__(self, maxsize: int, ttl: float) -> None:
+
+class _CircuitBreaker:
+    """Fail-fast breaker so a dead Redis cannot stall every request."""
+
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+    def __init__(self, failure_threshold: int = 5, reset_timeout: float = 15.0) -> None:
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self._failures = 0
+        self._state = self.CLOSED
+        self._opened_at = 0.0
+        self._probe_in_flight = False
+        self._lock = threading.Lock()
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            self._maybe_half_open_locked()
+            return self._state
+
+    def allow(self) -> bool:
+        with self._lock:
+            self._maybe_half_open_locked()
+            if self._state == self.CLOSED:
+                return True
+            if self._state == self.OPEN:
+                return False
+            if self._probe_in_flight:
+                return False
+            self._probe_in_flight = True
+            return True
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failures = 0
+            self._state = self.CLOSED
+            self._probe_in_flight = False
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._failures += 1
+            self._probe_in_flight = False
+            if self._state == self.HALF_OPEN or self._failures >= self.failure_threshold:
+                self._state = self.OPEN
+                self._opened_at = time.monotonic()
+
+    def force_open(self) -> None:
+        with self._lock:
+            self._state = self.OPEN
+            self._opened_at = time.monotonic()
+            self._failures = max(self._failures, self.failure_threshold)
+            self._probe_in_flight = False
+
+    def _maybe_half_open_locked(self) -> None:
+        if (
+            self._state == self.OPEN
+            and (time.monotonic() - self._opened_at) >= self.reset_timeout
+        ):
+            self._state = self.HALF_OPEN
+            self._probe_in_flight = False
+
+
+class _L1Cache:
+    """Thread-safe in-process LRU with fresh TTL + optional stale-if-error window."""
+
+    def __init__(self, maxsize: int, ttl: float, stale_ttl: float = 0.0) -> None:
         self.maxsize = maxsize
         self.ttl = ttl
+        self.stale_ttl = stale_ttl
         self._lock = threading.RLock()
-        self._data: OrderedDict[str, Tuple[Any, float]] = OrderedDict()
+        # key -> (value, fresh_until, stale_until)
+        self._data: OrderedDict[str, Tuple[Any, float, float]] = OrderedDict()
 
     @property
     def enabled(self) -> bool:
         return self.maxsize > 0 and self.ttl > 0
 
-    def get(self, key: str) -> Tuple[bool, Any]:
+    def get(self, key: str, *, allow_stale: bool = False) -> Tuple[str, Any]:
+        """Return ``("fresh"|"stale"|"miss", value)``."""
         if not self.enabled:
-            return False, None
+            return "miss", None
         now = time.monotonic()
         with self._lock:
             item = self._data.get(key)
             if item is None:
-                return False, None
-            value, expires_at = item
-            if expires_at <= now:
+                return "miss", None
+            value, fresh_until, stale_until = item
+            if now < fresh_until:
+                self._data.move_to_end(key)
+                return "fresh", value
+            if allow_stale and now < stale_until:
+                self._data.move_to_end(key)
+                return "stale", value
+            if now >= stale_until:
                 del self._data[key]
-                return False, None
-            self._data.move_to_end(key)
-            return True, value
+            return "miss", None
 
-    def set(self, key: str, value: Any, ttl: Optional[float] = None) -> None:
+    def set(
+        self,
+        key: str,
+        value: Any,
+        ttl: Optional[float] = None,
+        stale_ttl: Optional[float] = None,
+    ) -> None:
         if not self.enabled:
             return
         lifetime = self.ttl if ttl is None else ttl
         if lifetime <= 0:
             return
-        expires_at = time.monotonic() + lifetime
+        grace = self.stale_ttl if stale_ttl is None else stale_ttl
+        now = time.monotonic()
+        fresh_until = now + lifetime
+        stale_until = fresh_until + max(0.0, grace)
         with self._lock:
             if key in self._data:
                 del self._data[key]
             while len(self._data) >= self.maxsize:
                 self._data.popitem(last=False)
-            self._data[key] = (value, expires_at)
+            self._data[key] = (value, fresh_until, stale_until)
 
     def delete(self, key: str) -> None:
         with self._lock:
             self._data.pop(key, None)
 
-    def delete_matching(self, pattern: str) -> None:
+    def delete_matching(self, pattern: str) -> int:
+        removed = 0
         with self._lock:
             for key in [k for k in self._data if fnmatch.fnmatch(k, pattern)]:
                 del self._data[key]
+                removed += 1
+        return removed
+
+    def keys(self) -> List[str]:
+        with self._lock:
+            return list(self._data.keys())
 
     def clear(self) -> None:
         with self._lock:
@@ -218,7 +322,8 @@ class RedisCache:
     Production-ready caching layer using Redis STRING keys directly.
 
     L1 memory + Redis L2, atomic TTL, stampede locks, cacheable ``None``,
-    and in-process per-key locks on mutations. Synchronous only.
+    in-process per-key locks, and fail-open when Redis is down (short
+    timeouts + circuit breaker + L1 / stale-if-error). Synchronous only.
 
     The namespace is always applied internally — callers may pass a bare
     key (``"user:123"``) or a fully-qualified key (``"CACHE:user:123"``);
@@ -254,6 +359,12 @@ class RedisCache:
         stampede_wait_interval: float = 0.05,
         ttl_jitter: float = 0.1,
         lock_stripes: int = 64,
+        fail_open: bool = True,
+        socket_timeout: float = 0.15,
+        circuit_failures: int = 5,
+        circuit_reset: float = 15.0,
+        l1_stale_ttl: float = 30.0,
+        l1_degraded_ttl: float = 60.0,
     ) -> None:
         """
         Initialize RedisCache instance.
@@ -275,10 +386,20 @@ class RedisCache:
             ttl_jitter: Extra Redis TTL as a fraction of the base (0.1 = +0–10%)
                         so hot keys do not expire in a single wave.
             lock_stripes: Number of in-process locks for set/delete/get_or_set.
+            fail_open: If True (default), Redis loss does not raise on get/set/
+                       delete/get_or_set. Serve L1 / stale L1 / factory instead.
+                       ``set_if_not_exists`` stays fail-closed (returns False).
+            socket_timeout: Redis socket and connect timeout in seconds. Keep
+                            this small so fail-open is fast.
+            circuit_failures: Consecutive Redis errors before the breaker opens.
+            circuit_reset: Seconds to skip Redis entirely after the breaker opens.
+            l1_stale_ttl: Extra seconds to keep expired L1 entries and serve them
+                          only when Redis is unavailable (stale-if-error).
+            l1_degraded_ttl: L1 lifetime used for writes while Redis is down.
 
         Raises:
             ValueError: If the Redis URL is invalid or a parameter is out of range.
-            ConnectionError: If the Redis server cannot be reached.
+            ConnectionError: If ``fail_open`` is False and Redis cannot be reached.
         """
         if l1_maxsize < 0:
             raise ValueError("l1_maxsize must be >= 0")
@@ -294,19 +415,40 @@ class RedisCache:
             raise ValueError("ttl_jitter must be between 0 and 1")
         if lock_stripes < 1:
             raise ValueError("lock_stripes must be >= 1")
+        if socket_timeout <= 0:
+            raise ValueError("socket_timeout must be > 0")
+        if circuit_failures < 1:
+            raise ValueError("circuit_failures must be >= 1")
+        if circuit_reset <= 0:
+            raise ValueError("circuit_reset must be > 0")
+        if l1_stale_ttl < 0:
+            raise ValueError("l1_stale_ttl must be >= 0")
+        if l1_degraded_ttl < 0:
+            raise ValueError("l1_degraded_ttl must be >= 0")
 
-        validate_redis_connection(url)
+        validate_redis_url(url)
         self.url: str = url
         self.prefix: str = prefix.upper()
         self.default_ttl: Optional[int] = default_ttl
+        self._fail_open = bool(fail_open)
+        self._socket_timeout = float(socket_timeout)
+        self._l1_degraded_ttl = float(l1_degraded_ttl)
         self._stampede_lock_ttl = int(stampede_lock_ttl)
         self._stampede_wait_timeout = float(stampede_wait_timeout)
         self._stampede_wait_interval = float(stampede_wait_interval)
         self._ttl_jitter = float(ttl_jitter)
-        self._client: redis.Redis = redis.Redis.from_url(
-            self.url, decode_responses=True
+        self._breaker = _CircuitBreaker(
+            failure_threshold=circuit_failures,
+            reset_timeout=circuit_reset,
         )
-        self._l1 = _L1Cache(maxsize=l1_maxsize, ttl=l1_ttl)
+        self._client: redis.Redis = redis.Redis.from_url(
+            self.url,
+            decode_responses=True,
+            socket_connect_timeout=self._socket_timeout,
+            socket_timeout=self._socket_timeout,
+            retry_on_timeout=False,
+        )
+        self._l1 = _L1Cache(maxsize=l1_maxsize, ttl=l1_ttl, stale_ttl=l1_stale_ttl)
         self._stripes = [threading.RLock() for _ in range(lock_stripes)]
         self._rebuild_events: Dict[str, threading.Event] = {}
         self._rebuild_events_guard = threading.Lock()
@@ -317,6 +459,15 @@ class RedisCache:
         self._lua_commit_rebuild = self._client.register_script(_LUA_COMMIT_REBUILD)
         self._lua_delete_fence = self._client.register_script(_LUA_DELETE_FENCE)
         self._lua_release_lock = self._client.register_script(_LUA_RELEASE_LOCK)
+        try:
+            self._client.ping()
+        except redis.exceptions.RedisError as exc:
+            if not self._fail_open:
+                raise ConnectionError(
+                    f"Could not connect to Redis at {url!r}: {exc}"
+                ) from exc
+            self._breaker.force_open()
+            self._m("errors")
 
     # ──────────────────────────────────────────────
     # INTERNAL HELPERS
@@ -381,12 +532,22 @@ class RedisCache:
     def _ttl_arg(self, ttl_secs: Optional[int]) -> str:
         return str(ttl_secs) if ttl_secs is not None else ""
 
-    def _l1_put(self, bare: str, value: Any, redis_ttl: Optional[int]) -> None:
+    def _l1_put(
+        self,
+        bare: str,
+        value: Any,
+        redis_ttl: Optional[int],
+        *,
+        degraded: bool = False,
+    ) -> None:
         if not self._l1.enabled:
             return
-        lifetime = self._l1.ttl
-        if redis_ttl is not None:
-            lifetime = min(lifetime, float(redis_ttl))
+        if degraded:
+            lifetime = self._l1_degraded_ttl or self._l1.ttl
+        else:
+            lifetime = self._l1.ttl
+            if redis_ttl is not None:
+                lifetime = min(lifetime, float(redis_ttl))
         self._l1.set(bare, value, ttl=lifetime)
 
     def _m(self, name: str, n: int = 1) -> None:
@@ -394,26 +555,50 @@ class RedisCache:
             self._metrics[name] = self._metrics.get(name, 0) + n
 
     def _redis(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        if not self._breaker.allow():
+            self._m("circuit_skipped")
+            if self._fail_open:
+                raise _RedisUnavailable("circuit open")
+            raise ConnectionError("Redis circuit open")
         try:
-            return fn(*args, **kwargs)
-        except redis.exceptions.RedisError:
+            result = fn(*args, **kwargs)
+            self._breaker.record_success()
+            return result
+        except redis.exceptions.RedisError as exc:
+            self._breaker.record_failure()
             self._m("errors")
+            if self._fail_open:
+                raise _RedisUnavailable("redis error") from exc
             raise
 
     def _lookup(self, bare: str, *, count_get: bool = False) -> Tuple[bool, Any]:
         """
         Return ``(found, value)``. ``found=True`` and ``value=None`` means
         ``None`` was cached. ``found=False`` means the key is absent.
+
+        On Redis loss (fail-open): serve fresh L1, then stale L1, else miss.
         """
         if count_get:
             self._m("gets")
         if self._l1.enabled:
-            found, value = self._l1.get(bare)
-            if found:
+            status, value = self._l1.get(bare, allow_stale=False)
+            if status == "fresh":
                 self._m("l1_hits")
                 return True, value
             self._m("l1_misses")
-        raw = self._redis(self._client.get, self._key(bare))
+        try:
+            raw = self._redis(self._client.get, self._key(bare))
+        except _RedisUnavailable:
+            self._m("fail_open_gets")
+            if self._l1.enabled:
+                status, value = self._l1.get(bare, allow_stale=True)
+                if status in ("fresh", "stale"):
+                    if status == "stale":
+                        self._m("stale_serves")
+                    else:
+                        self._m("l1_hits")
+                    return True, value
+            return False, None
         if raw is None:
             self._m("redis_misses")
             return False, None
@@ -483,21 +668,34 @@ class RedisCache:
         lock_key = self._lock_key(bare)
         ttl_arg = self._ttl_arg(ttl_secs)
         with self._locked_keys(bare):
-            if overwrite:
-                self._redis(
-                    self._lua_set_fence, keys=[data_key, lock_key], args=[serialized, ttl_arg]
-                )
-            else:
-                stored = self._redis(
-                    self._lua_set_nx_fence,
-                    keys=[data_key, lock_key],
-                    args=[serialized, ttl_arg],
-                )
-                if not stored:
-                    raise ValueError(
-                        f"Key '{data_key}' already exists. Use overwrite=True to replace."
+            redis_ok = True
+            try:
+                if overwrite:
+                    self._redis(
+                        self._lua_set_fence,
+                        keys=[data_key, lock_key],
+                        args=[serialized, ttl_arg],
                     )
-            self._l1_put(bare, value, ttl_secs)
+                else:
+                    stored = self._redis(
+                        self._lua_set_nx_fence,
+                        keys=[data_key, lock_key],
+                        args=[serialized, ttl_arg],
+                    )
+                    if not stored:
+                        raise ValueError(
+                            f"Key '{data_key}' already exists. Use overwrite=True to replace."
+                        )
+            except _RedisUnavailable:
+                redis_ok = False
+                self._m("fail_open_sets")
+                if not overwrite:
+                    status, _ = self._l1.get(bare, allow_stale=True)
+                    if status in ("fresh", "stale"):
+                        raise ValueError(
+                            f"Key '{data_key}' already exists. Use overwrite=True to replace."
+                        )
+            self._l1_put(bare, value, ttl_secs, degraded=not redis_ok)
             self._m("sets")
         return True
 
@@ -548,10 +746,13 @@ class RedisCache:
                         args=[],
                         client=pipe,
                     )
-                results = pipe.execute()
-            except redis.exceptions.RedisError:
-                self._m("errors")
-                raise
+                results = self._redis(pipe.execute)
+            except _RedisUnavailable:
+                self._m("fail_open_deletes")
+                self._m("invalidation_failed")
+                for bare in bares:
+                    self._l1.delete(bare)
+                return 0
             for bare, result in zip(bares, results):
                 if int(result or 0) > 0:
                     deleted += 1
@@ -573,10 +774,17 @@ class RedisCache:
         """
         bare = self._normalize_key(key)
         if self._l1.enabled:
-            found, _ = self._l1.get(bare)
-            if found:
+            status, _ = self._l1.get(bare, allow_stale=False)
+            if status == "fresh":
                 return True
-        return bool(self._redis(self._client.exists, self._key(bare)))
+        try:
+            return bool(self._redis(self._client.exists, self._key(bare)))
+        except _RedisUnavailable:
+            if self._l1.enabled:
+                status, _ = self._l1.get(bare, allow_stale=True)
+                if status in ("fresh", "stale"):
+                    return True
+            return False
 
     # ──────────────────────────────────────────────
     # TTL OPERATIONS
@@ -592,7 +800,15 @@ class RedisCache:
         Returns:
             Remaining seconds, -1 if no expiry, -2 if the key does not exist.
         """
-        return int(self._redis(self._client.ttl, self._key(self._normalize_key(key))))
+        try:
+            return int(self._redis(self._client.ttl, self._key(self._normalize_key(key))))
+        except _RedisUnavailable:
+            bare = self._normalize_key(key)
+            if self._l1.enabled:
+                status, _ = self._l1.get(bare, allow_stale=True)
+                if status in ("fresh", "stale"):
+                    return -1
+            return -2
 
     def expire(self, key: str, seconds: int) -> bool:
         """
@@ -607,10 +823,17 @@ class RedisCache:
         """
         bare = self._normalize_key(key)
         with self._locked_keys(bare):
-            ok = bool(self._redis(self._client.expire, self._key(bare), seconds))
+            try:
+                ok = bool(self._redis(self._client.expire, self._key(bare), seconds))
+            except _RedisUnavailable:
+                status, value = self._l1.get(bare, allow_stale=True)
+                if status in ("fresh", "stale"):
+                    self._l1_put(bare, value, redis_ttl=seconds, degraded=True)
+                    return True
+                return False
             if ok:
-                found, value = self._l1.get(bare)
-                if found:
+                status, value = self._l1.get(bare, allow_stale=True)
+                if status in ("fresh", "stale"):
                     self._l1_put(bare, value, redis_ttl=seconds)
             return ok
 
@@ -626,7 +849,11 @@ class RedisCache:
         """
         bare = self._normalize_key(key)
         with self._locked_keys(bare):
-            return bool(self._redis(self._client.persist, self._key(bare)))
+            try:
+                return bool(self._redis(self._client.persist, self._key(bare)))
+            except _RedisUnavailable:
+                status, _ = self._l1.get(bare, allow_stale=True)
+                return status in ("fresh", "stale")
 
     # ──────────────────────────────────────────────
     # CACHE-SPECIFIC PATTERNS
@@ -642,10 +869,13 @@ class RedisCache:
         Cache-aside with stampede protection. ``None`` from ``factory`` is cached.
 
         1. L1 then Redis. Hit (including cached ``None``) returns immediately.
-        2. In-process stripe lock — only one thread per key rebuilds here.
+        2. In-process stripe lock — only one thread tries to take the rebuild lock.
         3. Redis ``SET NX`` rebuild lock — only one process across pods rebuilds.
-        4. Commit via Lua only if we still own the lock (set/delete fence us).
-        5. Waiters retry GET until the winner writes, or until wait timeout.
+        4. Same-process waiters block on a ``threading.Event``.
+        5. Commit via Lua **only if** we still own the lock.
+        6. If Redis is down: skip the distributed lock, run factory once in this
+           process, store in L1 for ``l1_degraded_ttl``. Other pods each rebuild
+           once (circuit is open so they do not stall on Redis).
 
         Args:
             key: Cache key. Accepts bare or prefixed forms.
@@ -664,52 +894,67 @@ class RedisCache:
         token = uuid.uuid4().hex
         lock_key = self._lock_key(bare)
         acquired = False
+        redis_down = False
         rebuild_event: Optional[threading.Event] = None
         with self._locked_keys(bare):
             found, value = self._lookup(bare, count_get=False)
             if found:
                 return value
-            acquired = bool(
-                self._redis(
-                    self._client.set,
-                    lock_key,
-                    token,
-                    nx=True,
-                    ex=self._stampede_lock_ttl,
+            try:
+                acquired = bool(
+                    self._redis(
+                        self._client.set,
+                        lock_key,
+                        token,
+                        nx=True,
+                        ex=self._stampede_lock_ttl,
+                    )
                 )
-            )
+            except _RedisUnavailable:
+                redis_down = True
+                acquired = True
             if acquired:
                 rebuild_event = threading.Event()
                 with self._rebuild_events_guard:
                     self._rebuild_events[bare] = rebuild_event
 
-        # Factory / wait run *without* the stripe lock so other keys on the
-        # same stripe are not blocked for the duration of a slow rebuild.
         if acquired:
             self._m("stampede_locks_acquired")
             try:
                 value = factory() if callable(factory) else factory
                 self._m("rebuilds")
                 ttl_secs = self._effective_ttl(ttl)
-                committed = self._redis(
-                    self._lua_commit_rebuild,
-                    keys=[self._key(bare), lock_key],
-                    args=[token, self._serialize(value), self._ttl_arg(ttl_secs)],
-                )
+                committed = False
+                if not redis_down:
+                    try:
+                        committed = bool(
+                            self._redis(
+                                self._lua_commit_rebuild,
+                                keys=[self._key(bare), lock_key],
+                                args=[
+                                    token,
+                                    self._serialize(value),
+                                    self._ttl_arg(ttl_secs),
+                                ],
+                            )
+                        )
+                    except _RedisUnavailable:
+                        committed = False
+                with self._locked_keys(bare):
+                    self._l1_put(bare, value, ttl_secs, degraded=not committed)
+                    self._m("sets")
                 if committed:
-                    with self._locked_keys(bare):
-                        self._l1_put(bare, value, ttl_secs)
-                        self._m("sets")
                     return value
                 found, current = self._lookup(bare, count_get=False)
                 if found:
                     return current
                 return value
             except Exception:
-                try:
-                    self._lua_release_lock(keys=[lock_key], args=[token])
-                except redis.exceptions.RedisError:
-                    self._m("errors")
+                if not redis_down:
+                    try:
+                        self._lua_release_lock(keys=[lock_key], args=[token])
+                    except (redis.exceptions.RedisError, _RedisUnavailable):
+                        self._m("errors")
                 raise
             finally:
                 if rebuild_event is not None:
@@ -736,7 +981,10 @@ class RedisCache:
         if found:
             return value
         self._m("rebuilds")
-        return factory() if callable(factory) else factory
+        value = factory() if callable(factory) else factory
+        ttl_secs = self._effective_ttl(ttl)
+        self._l1_put(bare, value, ttl_secs, degraded=True)
+        return value
 
     def set_if_not_exists(
         self, key: str, value: Any, ttl: Optional[int] = None
@@ -754,20 +1002,28 @@ class RedisCache:
 
         Returns:
             True if the value was stored, False if the key already exists.
+            Returns False (does **not** grant the claim) when Redis is down.
         """
         bare = self._normalize_key(key)
         ttl_secs = self._effective_ttl(ttl, jitter=False)
         serialized = self._serialize(value)
         data_key = self._key(bare)
         with self._locked_keys(bare):
-            if ttl_secs is not None:
-                result = self._redis(
-                    self._client.set, data_key, serialized, nx=True, ex=ttl_secs
-                )
-            else:
-                result = self._redis(self._client.set, data_key, serialized, nx=True)
+            try:
+                if ttl_secs is not None:
+                    result = self._redis(
+                        self._client.set, data_key, serialized, nx=True, ex=ttl_secs
+                    )
+                else:
+                    result = self._redis(self._client.set, data_key, serialized, nx=True)
+            except _RedisUnavailable:
+                self._m("lock_denied")
+                return False
             if result:
-                self._redis(self._client.delete, self._lock_key(bare))
+                try:
+                    self._redis(self._client.delete, self._lock_key(bare))
+                except _RedisUnavailable:
+                    pass
                 self._l1_put(bare, value, ttl_secs)
                 self._m("sets")
             return bool(result)
@@ -816,18 +1072,25 @@ class RedisCache:
                         else:
                             pipe.set(full_key, serialized, nx=True)
                     pipe.delete(self._lock_key(bare))
-                results = pipe.execute()
-            except redis.exceptions.RedisError:
-                self._m("errors")
-                raise
-            # results are [set, del, set, del, ...]
+                results = self._redis(pipe.execute)
+            except _RedisUnavailable:
+                self._m("fail_open_sets")
+                for bare, value in items:
+                    if overwrite:
+                        self._l1_put(bare, value, ttl_secs, degraded=True)
+                        stored += 1
+                    else:
+                        status, _ = self._l1.get(bare, allow_stale=True)
+                        if status not in ("fresh", "stale"):
+                            self._l1_put(bare, value, ttl_secs, degraded=True)
+                            stored += 1
+                self._m("sets", stored)
+                return stored
             for i, (bare, value) in enumerate(items):
                 set_result = results[i * 2]
                 if overwrite or set_result:
                     stored += 1
                     self._l1_put(bare, value, ttl_secs)
-                elif not overwrite:
-                    pass
             self._m("sets", stored)
         return stored
 
@@ -856,8 +1119,8 @@ class RedisCache:
         missing: List[str] = []
         for bare in normalized:
             if self._l1.enabled:
-                found, value = self._l1.get(bare)
-                if found:
+                status, value = self._l1.get(bare, allow_stale=False)
+                if status == "fresh":
                     self._m("l1_hits")
                     output[bare] = value
                     continue
@@ -869,10 +1132,19 @@ class RedisCache:
             pipe = self._client.pipeline(transaction=False)
             for bare in missing:
                 pipe.get(self._key(bare))
-            results = pipe.execute()
-        except redis.exceptions.RedisError:
-            self._m("errors")
-            raise
+            results = self._redis(pipe.execute)
+        except _RedisUnavailable:
+            self._m("fail_open_gets")
+            for bare in missing:
+                if self._l1.enabled:
+                    status, value = self._l1.get(bare, allow_stale=True)
+                    if status in ("fresh", "stale"):
+                        if status == "stale":
+                            self._m("stale_serves")
+                        output[bare] = value
+                        continue
+                output[bare] = default
+            return output
         for bare, raw in zip(missing, results):
             if raw is None:
                 self._m("redis_misses")
@@ -918,6 +1190,9 @@ class RedisCache:
         snap["l1_hit_rate"] = round(l1_hits / l1_lookups, 4) if l1_lookups else 0.0
         snap["l1_size"] = len(self._l1)
         snap["l1_enabled"] = self._l1.enabled
+        snap["fail_open"] = self._fail_open
+        snap["circuit_state"] = self._breaker.state
+        snap["socket_timeout"] = self._socket_timeout
         return snap
 
     def reset_metrics(self) -> None:
@@ -940,14 +1215,18 @@ class RedisCache:
         search = f"{self.prefix}:{pattern}*" if pattern else f"{self.prefix}:*"
         total = 0
         cursor = 0
-        while True:
-            cursor, found = self._redis(
-                self._client.scan, cursor=cursor, match=search, count=batch_size
-            )
-            total += sum(1 for k in found if not self._is_lock_key(k))
-            if cursor == 0:
-                break
-        return total
+        try:
+            while True:
+                cursor, found = self._redis(
+                    self._client.scan, cursor=cursor, match=search, count=batch_size
+                )
+                total += sum(1 for k in found if not self._is_lock_key(k))
+                if cursor == 0:
+                    break
+            return total
+        except _RedisUnavailable:
+            glob_pat = f"{pattern}*" if pattern else "*"
+            return sum(1 for k in self._l1.keys() if fnmatch.fnmatch(k, glob_pat))
 
     def list_keys(
         self,
@@ -971,16 +1250,20 @@ class RedisCache:
         search = f"{self.prefix}:{pattern}*" if pattern else f"{self.prefix}:*"
         keys_list: List[str] = []
         cursor = 0
-        while True:
-            cursor, found = self._redis(
-                self._client.scan, cursor=cursor, match=search, count=batch_size
-            )
-            for full_key in found:
-                if self._is_lock_key(full_key):
-                    continue
-                keys_list.append(full_key.removeprefix(f"{self.prefix}:"))
-            if cursor == 0:
-                break
+        try:
+            while True:
+                cursor, found = self._redis(
+                    self._client.scan, cursor=cursor, match=search, count=batch_size
+                )
+                for full_key in found:
+                    if self._is_lock_key(full_key):
+                        continue
+                    keys_list.append(full_key.removeprefix(f"{self.prefix}:"))
+                if cursor == 0:
+                    break
+        except _RedisUnavailable:
+            glob_pat = f"{pattern}*" if pattern else "*"
+            keys_list = [k for k in self._l1.keys() if fnmatch.fnmatch(k, glob_pat)]
         if offset > 0 or limit > 0:
             end = offset + limit if limit > 0 else None
             return keys_list[offset:end]
@@ -1002,14 +1285,14 @@ class RedisCache:
         search = f"{self.prefix}:{pattern}"
         deleted = 0
         cursor = 0
-        while True:
-            cursor, found = self._redis(
-                self._client.scan, cursor=cursor, match=search, count=batch_size
-            )
-            data_keys = [k for k in found if not self._is_lock_key(k)]
-            lock_keys = [k for k in found if self._is_lock_key(k)]
-            if data_keys or lock_keys:
-                try:
+        try:
+            while True:
+                cursor, found = self._redis(
+                    self._client.scan, cursor=cursor, match=search, count=batch_size
+                )
+                data_keys = [k for k in found if not self._is_lock_key(k)]
+                lock_keys = [k for k in found if self._is_lock_key(k)]
+                if data_keys or lock_keys:
                     pipe = self._client.pipeline(transaction=False)
                     for full_key in data_keys:
                         bare = full_key.removeprefix(f"{self.prefix}:")
@@ -1018,16 +1301,17 @@ class RedisCache:
                         self._l1.delete(bare)
                     for full_key in lock_keys:
                         pipe.delete(full_key)
-                    results = pipe.execute()
-                except redis.exceptions.RedisError:
-                    self._m("errors")
-                    raise
-                # data_keys contribute two pipeline results each (data + lock)
-                for i in range(len(data_keys)):
-                    if int(results[i * 2] or 0) > 0:
-                        deleted += 1
-            if cursor == 0:
-                break
+                    results = self._redis(pipe.execute)
+                    for i in range(len(data_keys)):
+                        if int(results[i * 2] or 0) > 0:
+                            deleted += 1
+                if cursor == 0:
+                    break
+        except _RedisUnavailable:
+            self._m("fail_open_deletes")
+            self._m("invalidation_failed")
+            removed = self._l1.delete_matching(pattern)
+            return removed
         self._l1.delete_matching(pattern)
         self._m("deletes", deleted)
         return deleted
@@ -1072,8 +1356,8 @@ class RedisCache:
         """String representation of RedisCache."""
         return (
             f"RedisCache(url='{self.url}', prefix='{self.prefix}', "
-            f"default_ttl={self.default_ttl}, l1_maxsize={self._l1.maxsize}, "
-            f"l1_ttl={self._l1.ttl})"
+            f"default_ttl={self.default_ttl}, fail_open={self._fail_open}, "
+            f"circuit={self._breaker.state})"
         )
 
     def __enter__(self) -> "RedisCache":

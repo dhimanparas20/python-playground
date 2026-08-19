@@ -1,6 +1,6 @@
 # RedisCache — Standalone Caching Layer
 
-A self-contained Redis/Valkey cache for Python. Redis **STRING** keys, JSON values, L1 memory, atomic TTL, stampede-safe cache-aside, cacheable `None`, per-key locks on set/delete, and process-local metrics.
+A self-contained Redis/Valkey cache for Python. Redis **STRING** keys, JSON values, L1 memory, atomic TTL, stampede-safe cache-aside, cacheable `None`, per-key locks, fail-open on Redis loss, and process-local metrics.
 
 This file (`redis_cache.py`) does **not** wrap `RedisStringUtil`. STRING commands live inside each method.
 
@@ -13,6 +13,7 @@ This file (`redis_cache.py`) does **not** wrap `RedisStringUtil`. STRING command
 - [Constructor](#constructor)
 - [How Keys Work](#how-keys-work)
 - [L1 In-Process Cache](#l1-in-process-cache)
+- [Fail-open when Redis is down](#fail-open-when-redis-is-down)
 - [Type Preservation & Caching None](#type-preservation--caching-none)
 - [Core Operations](#core-operations)
 - [Locks on Set and Delete](#locks-on-set-and-delete)
@@ -67,13 +68,14 @@ cache = RedisCache(
     url="redis://localhost:6379/0",
     prefix="CACHE",
     default_ttl=600,
-    l1_maxsize=1024,          # in-process LRU; 0 disables L1
-    l1_ttl=2.0,               # seconds in L1 (keep short)
-    stampede_lock_ttl=30,     # rebuild lock must outlast factory()
-    stampede_wait_timeout=1.0,
-    stampede_wait_interval=0.05,
-    ttl_jitter=0.1,           # +0–10% on Redis TTL
-    lock_stripes=64,          # in-process locks for set/delete/get_or_set
+    l1_maxsize=1024,
+    l1_ttl=2.0,
+    fail_open=True,            # Redis down → L1 / factory, do not raise
+    socket_timeout=0.15,       # fail fast (150ms)
+    circuit_failures=5,
+    circuit_reset=15.0,
+    l1_stale_ttl=30.0,         # serve expired L1 only when Redis is down
+    l1_degraded_ttl=60.0,      # L1 lifetime while Redis is down
 )
 ```
 
@@ -91,6 +93,12 @@ Connection is validated at init: URL scheme check (`redis` / `rediss` / `unix`) 
 | `stampede_wait_interval` | `float` | `0.05` | Sleep between waiter GET retries (cross-process) |
 | `ttl_jitter` | `float` | `0.1` | Extra Redis TTL as a fraction of the base (`0` = none) |
 | `lock_stripes` | `int` | `64` | In-process stripe locks for mutations |
+| `fail_open` | `bool` | `True` | If Redis dies, get/set/delete/get_or_set keep working via L1 + origin |
+| `socket_timeout` | `float` | `0.15` | Redis connect/read timeout in seconds (fail fast) |
+| `circuit_failures` | `int` | `5` | Errors before the breaker stops calling Redis |
+| `circuit_reset` | `float` | `15.0` | Seconds to skip Redis after the breaker opens |
+| `l1_stale_ttl` | `float` | `30.0` | Serve expired L1 only while Redis is down |
+| `l1_degraded_ttl` | `float` | `60.0` | L1 TTL for writes while Redis is down |
 
 ```python
 # Ephemeral cache — Redis entries auto-expire after 10 minutes
@@ -146,6 +154,43 @@ get("user:123")
 - Keep `l1_ttl` short so a delete from another pod is visible quickly
 - `set` / `delete` / `invalidate` / `flush` update or drop L1 immediately in **this** process
 - Disable with `l1_maxsize=0` or `l1_ttl=0`
+
+When Redis is down, L1 is the cache: new writes use `l1_degraded_ttl` (default 60s), and expired entries can still be served for `l1_stale_ttl` (stale-if-error).
+
+---
+
+## Fail-open when Redis is down
+
+Default: **the app keeps serving**. Redis is treated as optional.
+
+```
+request
+  → L1 fresh?          return (no Redis)
+  → circuit OPEN?      skip Redis (no wait)
+  → Redis GET ≤150ms
+       ok    → fill L1, return
+       error → trip breaker after 5 failures
+            → serve stale L1 if still in grace window
+            → else miss / run factory
+            → store in L1 for 60s
+```
+
+| Method | Redis down |
+|--------|------------|
+| `get` / `lookup` / `bulk_get` | L1, then stale L1, else miss / `default`. Does not raise. |
+| `get_or_set` | Run `factory` once in this process, keep result in L1. Does not raise. |
+| `set` / `bulk_set` | Write L1, skip Redis. Does not raise. |
+| `delete` / `invalidate` / `flush` | Drop L1. Redis invalidate is best-effort (`invalidation_failed` metric). |
+| `set_if_not_exists` | **Fail-closed** — returns `False` (does not grant the job/lock). |
+
+A **circuit breaker** is what keeps this fast. After 5 errors, Redis is not called for 15s. Without it, every request would wait on a TCP timeout.
+
+Startup: if Redis is down and `fail_open=True`, the cache still constructs (circuit starts open). If `fail_open=False`, init raises `ConnectionError` like before.
+
+```python
+# Strict mode — Redis errors propagate (sessions / must-have Redis)
+sessions = RedisCache(prefix="SESSIONS", fail_open=False)
+
 
 ```python
 cache = RedisCache(l1_maxsize=4096, l1_ttl=1.0)
@@ -363,10 +408,18 @@ stats = cache.metrics()
 #   "stampede_locks_acquired": 50,
 #   "stampede_waited": 12,
 #   "stampede_lock_timeouts": 0,
-#   "hit_rate": 0.95,        # (l1_hits + redis_hits) / gets
-#   "l1_hit_rate": 0.80,     # l1_hits / (l1_hits + l1_misses)
+#   "fail_open_gets": 0,
+#   "circuit_skipped": 0,
+#   "stale_serves": 0,
+#   "invalidation_failed": 0,
+#   "lock_denied": 0,
+#   "hit_rate": 0.95,
+#   "l1_hit_rate": 0.80,
 #   "l1_size": 120,
 #   "l1_enabled": True,
+#   "fail_open": True,
+#   "circuit_state": "closed",
+#   "socket_timeout": 0.15,
 # }
 
 cache.reset_metrics()
@@ -427,8 +480,10 @@ def get_feed(user_id: str) -> dict:
 
 ### 2. Session store
 
+Redis is the source of truth here — fail-closed so a Redis outage does not invent a session.
+
 ```python
-sessions = RedisCache(prefix="SESSIONS", default_ttl=86400)
+sessions = RedisCache(prefix="SESSIONS", default_ttl=86400, fail_open=False)
 
 sessions.set(session_id, {
     "user_id": "u-001",
@@ -563,15 +618,16 @@ cache = RedisCache(
 - Fail-fast connect: URL validation + `PING`
 - Prefix uppercased; bare and prefixed keys resolve to the same data entry
 - `count` / `list_keys` / `invalidate` / `flush` use **SCAN**, never `KEYS`
-- Redis errors increment `errors` and **propagate** (no fail-open)
+- Redis errors increment `errors`; with `fail_open=True` they **do not** raise on get/set/delete/get_or_set
+- Circuit breaker skips Redis after consecutive failures (`circuit_state` in `metrics()`)
+- `set_if_not_exists` stays fail-closed (returns `False` if Redis is down)
 - Synchronous only
 - Independent of `redis_core_util.py`
 
 ### Still not in this class (by design)
 
-- Fail-open when Redis is down (callers must catch and fall back)
 - Redis Cluster hash tags (Lua uses two keys; fine on standalone / Sentinel)
-- Cross-process L1 invalidation (pub/sub) — keep `l1_ttl` short instead
+- Cross-process L1 invalidation (pub/sub) — keep `l1_ttl` short; L1 is dropped on local delete
 - Async API
 
 ### vs `RedisCache` in `redis_core_util.py`
