@@ -76,6 +76,7 @@ cache = RedisCache(
     circuit_reset=15.0,
     l1_stale_ttl=30.0,         # serve expired L1 only when Redis is down
     l1_degraded_ttl=60.0,      # L1 lifetime while Redis is down
+    max_value_size=1_048_576,  # 1 MiB cap (0 = unlimited)
 )
 ```
 
@@ -99,6 +100,7 @@ Connection is validated at init: URL scheme check (`redis` / `rediss` / `unix`) 
 | `circuit_reset` | `float` | `15.0` | Seconds to skip Redis after the breaker opens |
 | `l1_stale_ttl` | `float` | `30.0` | Serve expired L1 only while Redis is down |
 | `l1_degraded_ttl` | `float` | `60.0` | L1 TTL for writes while Redis is down |
+| `max_value_size` | `int` | `1048576` (1 MiB) | Max UTF-8 bytes per value. `0` disables. `set` raises; `get_or_set` skips cache |
 
 ```python
 # Ephemeral cache — Redis entries auto-expire after 10 minutes
@@ -259,6 +261,10 @@ cache.exists("user:123")   # True / False — cached None counts as existing
 cache.set("config:theme", "dark", overwrite=False)
 cache.set("config:theme", "light", overwrite=False)
 # ValueError: Key 'CACHE:config:theme' already exists.
+
+# Oversized values (default cap 1 MiB)
+cache.set("blob", "x" * 2_000_000)
+# ValueError: Cache value for 'CACHE:blob' is 2000000 bytes; max_value_size is 1048576 bytes.
 ```
 
 ---
@@ -614,7 +620,8 @@ cache = RedisCache(
 - **`None` is cacheable** — use `lookup` or `get_or_set`; `get()` stays convenient
 - **Stampede** — in-process Event + Redis `SET NX` rebuild lock + Lua token check
 - **Set/delete locks** — in-process stripes + fence (`DEL` rebuild lock) so a late rebuild cannot clobber a write or undelete
-- **Metrics** — `gets`, L1/Redis hits, sets, deletes, errors, stampede counters, hit rates
+- **Value size cap** — default **1 MiB** (memcached’s classic limit). A 50MB blob × 1024 L1 slots would be tens of GB. `set` / `set_if_not_exists` raise `ValueError`; `bulk_set` skips that key; `get_or_set` still returns the value but does not store it. Already-huge Redis keys are not copied into L1.
+- **Metrics** — `gets`, L1/Redis hits, sets, deletes, errors, stampede counters, `oversized_rejected` / `oversized_skipped`, hit rates
 - Fail-fast connect: URL validation + `PING`
 - Prefix uppercased; bare and prefixed keys resolve to the same data entry
 - `count` / `list_keys` / `invalidate` / `flush` use **SCAN**, never `KEYS`

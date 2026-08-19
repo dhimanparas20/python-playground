@@ -16,6 +16,7 @@ Production behavior:
     - Per-key locks on set/delete so L1 and Redis stay consistent
     - Fail-open on Redis loss: short timeouts, circuit breaker, L1 degraded
       mode, stale-if-error. Locks (``set_if_not_exists``) stay fail-closed.
+    - 1 MiB max value size (configurable) so huge blobs cannot fill Redis/L1
     - Hit/miss/error metrics
 """
 
@@ -113,7 +114,13 @@ _METRIC_KEYS = (
     "circuit_skipped",
     "invalidation_failed",
     "lock_denied",
+    "oversized_rejected",
+    "oversized_skipped",
 )
+
+# 1 MiB. Memcached's classic cap. Redis allows 512MB; 50MB × 1024 L1
+# entries would be tens of GB in one process.
+DEFAULT_MAX_VALUE_SIZE = 1_048_576
 
 
 def validate_redis_url(url: str) -> None:
@@ -365,6 +372,7 @@ class RedisCache:
         circuit_reset: float = 15.0,
         l1_stale_ttl: float = 30.0,
         l1_degraded_ttl: float = 60.0,
+        max_value_size: int = DEFAULT_MAX_VALUE_SIZE,
     ) -> None:
         """
         Initialize RedisCache instance.
@@ -396,6 +404,10 @@ class RedisCache:
             l1_stale_ttl: Extra seconds to keep expired L1 entries and serve them
                           only when Redis is unavailable (stale-if-error).
             l1_degraded_ttl: L1 lifetime used for writes while Redis is down.
+            max_value_size: Max serialized UTF-8 bytes per value. Defaults to
+                            1 MiB. ``0`` disables the cap. Oversized ``set`` /
+                            ``set_if_not_exists`` raise; ``get_or_set`` still
+                            returns the value but does not cache it.
 
         Raises:
             ValueError: If the Redis URL is invalid or a parameter is out of range.
@@ -425,6 +437,8 @@ class RedisCache:
             raise ValueError("l1_stale_ttl must be >= 0")
         if l1_degraded_ttl < 0:
             raise ValueError("l1_degraded_ttl must be >= 0")
+        if max_value_size < 0:
+            raise ValueError("max_value_size must be >= 0")
 
         validate_redis_url(url)
         self.url: str = url
@@ -433,6 +447,7 @@ class RedisCache:
         self._fail_open = bool(fail_open)
         self._socket_timeout = float(socket_timeout)
         self._l1_degraded_ttl = float(l1_degraded_ttl)
+        self._max_value_size = int(max_value_size)
         self._stampede_lock_ttl = int(stampede_lock_ttl)
         self._stampede_wait_timeout = float(stampede_wait_timeout)
         self._stampede_wait_interval = float(stampede_wait_interval)
@@ -510,6 +525,28 @@ class RedisCache:
             return value
         return json.dumps(value, ensure_ascii=False, default=str)
 
+    def _payload_bytes(self, serialized: str) -> int:
+        """Wire size of a serialized cache value (UTF-8 bytes)."""
+        return len(serialized.encode("utf-8"))
+
+    def _too_large(self, serialized: str) -> bool:
+        if self._max_value_size <= 0:
+            return False
+        return self._payload_bytes(serialized) > self._max_value_size
+
+    def _reject_oversize(self, bare: str, serialized: str) -> None:
+        """Raise if an explicit write exceeds ``max_value_size``."""
+        if not self._too_large(serialized):
+            return
+        size = self._payload_bytes(serialized)
+        self._m("oversized_rejected")
+        raise ValueError(
+            f"Cache value for '{self._key(bare)}' is {size} bytes; "
+            f"max_value_size is {self._max_value_size} bytes. "
+            "Refusing to store — oversized values crowd out useful entries "
+            "and stall Redis."
+        )
+
     def _deserialize(self, raw: Optional[str]) -> Optional[Any]:
         """Deserialize a JSON string back to a Python object."""
         if raw is None:
@@ -539,9 +576,15 @@ class RedisCache:
         redis_ttl: Optional[int],
         *,
         degraded: bool = False,
+        serialized: Optional[str] = None,
     ) -> None:
         if not self._l1.enabled:
             return
+        if self._max_value_size > 0:
+            payload = serialized if serialized is not None else self._serialize(value)
+            if self._too_large(payload):
+                self._m("oversized_skipped")
+                return
         if degraded:
             lifetime = self._l1_degraded_ttl or self._l1.ttl
         else:
@@ -604,7 +647,7 @@ class RedisCache:
             return False, None
         self._m("redis_hits")
         value = self._deserialize(raw)
-        self._l1_put(bare, value, redis_ttl=None)
+        self._l1_put(bare, value, redis_ttl=None, serialized=raw)
         return True, value
 
     # ──────────────────────────────────────────────
@@ -659,11 +702,13 @@ class RedisCache:
             True if the value was stored.
 
         Raises:
-            ValueError: If the key exists and ``overwrite=False``.
+            ValueError: If the key exists and ``overwrite=False``, or if the
+                serialized value exceeds ``max_value_size``.
         """
         bare = self._normalize_key(key)
         ttl_secs = self._effective_ttl(ttl)
         serialized = self._serialize(value)
+        self._reject_oversize(bare, serialized)
         data_key = self._key(bare)
         lock_key = self._lock_key(bare)
         ttl_arg = self._ttl_arg(ttl_secs)
@@ -695,7 +740,7 @@ class RedisCache:
                         raise ValueError(
                             f"Key '{data_key}' already exists. Use overwrite=True to replace."
                         )
-            self._l1_put(bare, value, ttl_secs, degraded=not redis_ok)
+            self._l1_put(bare, value, ttl_secs, degraded=not redis_ok, serialized=serialized)
             self._m("sets")
         return True
 
@@ -924,6 +969,15 @@ class RedisCache:
                 value = factory() if callable(factory) else factory
                 self._m("rebuilds")
                 ttl_secs = self._effective_ttl(ttl)
+                serialized = self._serialize(value)
+                if self._too_large(serialized):
+                    self._m("oversized_skipped")
+                    if not redis_down:
+                        try:
+                            self._lua_release_lock(keys=[lock_key], args=[token])
+                        except (redis.exceptions.RedisError, _RedisUnavailable):
+                            self._m("errors")
+                    return value
                 committed = False
                 if not redis_down:
                     try:
@@ -933,7 +987,7 @@ class RedisCache:
                                 keys=[self._key(bare), lock_key],
                                 args=[
                                     token,
-                                    self._serialize(value),
+                                    serialized,
                                     self._ttl_arg(ttl_secs),
                                 ],
                             )
@@ -941,7 +995,9 @@ class RedisCache:
                     except _RedisUnavailable:
                         committed = False
                 with self._locked_keys(bare):
-                    self._l1_put(bare, value, ttl_secs, degraded=not committed)
+                    self._l1_put(
+                        bare, value, ttl_secs, degraded=not committed, serialized=serialized
+                    )
                     self._m("sets")
                 if committed:
                     return value
@@ -983,7 +1039,11 @@ class RedisCache:
         self._m("rebuilds")
         value = factory() if callable(factory) else factory
         ttl_secs = self._effective_ttl(ttl)
-        self._l1_put(bare, value, ttl_secs, degraded=True)
+        serialized = self._serialize(value)
+        if self._too_large(serialized):
+            self._m("oversized_skipped")
+            return value
+        self._l1_put(bare, value, ttl_secs, degraded=True, serialized=serialized)
         return value
 
     def set_if_not_exists(
@@ -1007,6 +1067,7 @@ class RedisCache:
         bare = self._normalize_key(key)
         ttl_secs = self._effective_ttl(ttl, jitter=False)
         serialized = self._serialize(value)
+        self._reject_oversize(bare, serialized)
         data_key = self._key(bare)
         with self._locked_keys(bare):
             try:
@@ -1024,7 +1085,7 @@ class RedisCache:
                     self._redis(self._client.delete, self._lock_key(bare))
                 except _RedisUnavailable:
                     pass
-                self._l1_put(bare, value, ttl_secs)
+                self._l1_put(bare, value, ttl_secs, serialized=serialized)
                 self._m("sets")
             return bool(result)
 
@@ -1047,20 +1108,28 @@ class RedisCache:
             overwrite: If False, existing keys are skipped (SET NX).
 
         Returns:
-            Number of entries stored.
+            Number of entries stored. Oversized values are skipped (not stored).
         """
         if not entries:
             return 0
         ttl_secs = self._effective_ttl(ttl)
-        items = [(self._normalize_key(k), v) for k, v in entries.items()]
-        bares = [b for b, _ in items]
+        accepted: List[Tuple[str, Any, str]] = []
+        for key, value in entries.items():
+            bare = self._normalize_key(key)
+            serialized = self._serialize(value)
+            if self._too_large(serialized):
+                self._m("oversized_rejected")
+                continue
+            accepted.append((bare, value, serialized))
+        if not accepted:
+            return 0
+        bares = [b for b, _, _ in accepted]
         stored = 0
         with self._locked_keys(*bares):
             try:
                 pipe = self._client.pipeline(transaction=False)
-                for bare, value in items:
+                for bare, value, serialized in accepted:
                     full_key = self._key(bare)
-                    serialized = self._serialize(value)
                     if overwrite:
                         if ttl_secs is not None:
                             pipe.set(full_key, serialized, ex=ttl_secs)
@@ -1075,22 +1144,26 @@ class RedisCache:
                 results = self._redis(pipe.execute)
             except _RedisUnavailable:
                 self._m("fail_open_sets")
-                for bare, value in items:
+                for bare, value, serialized in accepted:
                     if overwrite:
-                        self._l1_put(bare, value, ttl_secs, degraded=True)
+                        self._l1_put(
+                            bare, value, ttl_secs, degraded=True, serialized=serialized
+                        )
                         stored += 1
                     else:
                         status, _ = self._l1.get(bare, allow_stale=True)
                         if status not in ("fresh", "stale"):
-                            self._l1_put(bare, value, ttl_secs, degraded=True)
+                            self._l1_put(
+                                bare, value, ttl_secs, degraded=True, serialized=serialized
+                            )
                             stored += 1
                 self._m("sets", stored)
                 return stored
-            for i, (bare, value) in enumerate(items):
+            for i, (bare, value, serialized) in enumerate(accepted):
                 set_result = results[i * 2]
                 if overwrite or set_result:
                     stored += 1
-                    self._l1_put(bare, value, ttl_secs)
+                    self._l1_put(bare, value, ttl_secs, serialized=serialized)
             self._m("sets", stored)
         return stored
 
@@ -1152,7 +1225,7 @@ class RedisCache:
             else:
                 self._m("redis_hits")
                 value = self._deserialize(raw)
-                self._l1_put(bare, value, redis_ttl=None)
+                self._l1_put(bare, value, redis_ttl=None, serialized=raw)
                 output[bare] = value
         return output
 
@@ -1193,6 +1266,7 @@ class RedisCache:
         snap["fail_open"] = self._fail_open
         snap["circuit_state"] = self._breaker.state
         snap["socket_timeout"] = self._socket_timeout
+        snap["max_value_size"] = self._max_value_size
         return snap
 
     def reset_metrics(self) -> None:
