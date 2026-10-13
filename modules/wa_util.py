@@ -635,10 +635,10 @@ class WhatsAppUtil:
             - Strips ``+``, spaces, and other non-digits.
             - 10-digit numbers get ``default_country_code`` (default ``91``).
             - Longer numbers are treated as already including country code.
-            - Leading trunk ``0`` is removed (e.g. ``09418168860`` → ``91`` + 10 digits).
+            - Leading trunk ``0`` is removed (e.g. ``09876543210`` → ``91`` + 10 digits).
 
         Args:
-            phone: User input such as ``+919418168860``, ``919418168860``, or ``9418168860``.
+            phone: User input such as ``+919876543210``, ``919876543210``, or ``9876543210``.
             default_country_code: Used when only 10 local digits are present.
             country_code: Per-call override for ``default_country_code``.
 
@@ -669,7 +669,7 @@ class WhatsAppUtil:
             country_code: Optional override for ``default_country_code``.
 
         Returns:
-            Chat id string, e.g. ``919418168860@c.us``.
+            Chat id string, e.g. ``919876543210@c.us``.
         """
         raw = phone.strip()
         if "@" in raw:
@@ -691,11 +691,11 @@ class WhatsAppUtil:
         """
         Accept a WAHA ``chatId`` or a bare phone number and return ``chatId`` form.
 
-        WAHA expects ids like ``919418168860@c.us``, not ``+919418168860``.
+        WAHA expects ids like ``919876543210@c.us``, not ``+919876543210``.
         Ten-digit local numbers use this client's ``default_country_code`` (``91`` by default).
 
         Args:
-            chat_id: ``919418168860@c.us``, ``120363...@g.us``, ``...@lid``, or ``+91...``.
+            chat_id: ``919876543210@c.us``, ``120363...@g.us``, ``...@lid``, or ``+91...``.
             country_code: Optional per-call country code override (e.g. ``"1"`` for US).
 
         Returns:
@@ -1565,14 +1565,14 @@ class WhatsAppUtil:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-    assert WhatsAppUtil.normalize_phone_digits("+919418168860") == "919418168860"
-    assert WhatsAppUtil.normalize_phone_digits("919418168860") == "919418168860"
-    assert WhatsAppUtil.normalize_phone_digits("9418168860") == "919418168860"
-    assert WhatsAppUtil.normalize_phone_digits("09418168860") == "919418168860"
+    assert WhatsAppUtil.normalize_phone_digits("+919876543210") == "919876543210"
+    assert WhatsAppUtil.normalize_phone_digits("919876543210") == "919876543210"
+    assert WhatsAppUtil.normalize_phone_digits("9876543210") == "919876543210"
+    assert WhatsAppUtil.normalize_phone_digits("09876543210") == "919876543210"
     assert WhatsAppUtil.normalize_phone_digits("4155551234", country_code="1") == "14155551234"
     wa = WhatsAppUtil()
-    assert wa.normalize_chat_id("9418168860") == "919418168860@c.us"
-    assert wa.normalize_chat_id("+91 94181 68860") == "919418168860@c.us"
+    assert wa.normalize_chat_id("9876543210") == "919876543210@c.us"
+    assert wa.normalize_chat_id("+91 98765 43210") == "919876543210@c.us"
     print("phone normalization self-check OK")
 
     body = b'{"event":"message","session":"default","engine":"WEBJS"}'

@@ -36,9 +36,9 @@ wa = WhatsAppUtil(config=WhatsAppClientConfig(
     default_country_code="91",
 ))
 
-wa.send_text("9418168860", "Hello from Python!")       # 10-digit → +91
-wa.send_text("+919418168860", "Same chat")
-wa.send_image("9418168860", "https://picsum.photos/800/600", caption="Photo")
+wa.send_text("9876543210", "Hello from Python!")       # 10-digit → +91
+wa.send_text("+919876543210", "Same chat")
+wa.send_image("9876543210", "https://picsum.photos/800/600", caption="Photo")
 ```
 
 ## Environment Variables
@@ -238,21 +238,21 @@ from pathlib import Path
 from modules.wa_util import WhatsAppUtil
 
 # 1) Local file — str or Path (reads + base64 in file_from_path)
-wa.send_file("9418168860", "/tmp/report.pdf", caption="Monthly report")
-wa.send_image("9418168860", Path("photos/scan.jpg"))
+wa.send_file("9876543210", "/tmp/report.pdf", caption="Monthly report")
+wa.send_image("9876543210", Path("photos/scan.jpg"))
 
 # 2) Public URL — use send_image for photos (MIME + preview), send_file for documents
-wa.send_image("9418168860", "https://picsum.photos/400")
-wa.send_file("9418168860", "https://example.com/report.pdf")
+wa.send_image("9876543210", "https://picsum.photos/400")
+wa.send_file("9876543210", "https://example.com/report.pdf")
 
 # 3) Explicit WAHA file dict (remote or base64)
-wa.send_image("9418168860", WhatsAppUtil.file_from_url(
+wa.send_image("9876543210", WhatsAppUtil.file_from_url(
     "https://picsum.photos/200", mimetype="image/jpeg",
 ))
-wa.send_file("9418168860", WhatsAppUtil.file_from_path(Path("/tmp/a.pdf")))
+wa.send_file("9876543210", WhatsAppUtil.file_from_path(Path("/tmp/a.pdf")))
 
 # 4) Manual dict (same shape WAHA OpenAPI expects)
-wa.send_image("9418168860", {
+wa.send_image("9876543210", {
     "url": "https://picsum.photos/800/600",
     "mimetype": "image/jpeg",
 })
@@ -294,22 +294,22 @@ Bare numbers are normalized before every send:
 
 | Input | Result (default country `91`) |
 |-------|-------------------------------|
-| `9418168860` | `919418168860@c.us` |
-| `+919418168860` | `919418168860@c.us` |
-| `919418168860` | `919418168860@c.us` (country code kept) |
-| `09418168860` | `919418168860@c.us` (trunk `0` stripped) |
+| `9876543210` | `919876543210@c.us` |
+| `+919876543210` | `919876543210@c.us` |
+| `919876543210` | `919876543210@c.us` (country code kept) |
+| `09876543210` | `919876543210@c.us` (trunk `0` stripped) |
 
 ```python
 # Default India (+91) on the client
 wa = WhatsAppUtil(default_country_code="91")
-wa.send_text("9418168860", "hi")
+wa.send_text("9876543210", "hi")
 
 # One-off US number
 wa.send_text("4155551234", "hi", country_code="1")
 
 # Or env: WAHA_DEFAULT_COUNTRY_CODE=91
-WhatsAppUtil.normalize_phone_digits("9418168860")  # static, default 91
-wa.normalize_chat_id("+91 94181 68860")
+WhatsAppUtil.normalize_phone_digits("9876543210")  # static, default 91
+wa.normalize_chat_id("+91 98765 43210")
 ```
 
 ## Error Handling
