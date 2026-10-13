@@ -112,6 +112,7 @@ python-playground/
 │
 └── modules/                               # Production-grade utility modules
     ├── function_timer_decorator.py        # Execution time decorators
+    ├── wa_util.py                         # WAHA WhatsApp HTTP API client
     ├── logger.py                          # Structured logger (JSON, colors, redaction, tracing)
     ├── EMXQ_MQTT.py                       # EMQX v5 REST API client
     ├── RabbitMQQueue_play.py              # RabbitMQ queue handler
@@ -165,6 +166,7 @@ Each module has its own comprehensive README with full API docs.
 | Module | README | What It Does |
 |--------|--------|-------------|
 | `function_timer_decorator.py` | — | `@timeit` and `@timeit_stats` decorators with color-coded output |
+| `wa_util.py` | [modules/WAHA_README.md](modules/WAHA_README.md) | `WhatsAppUtil` + `WAHAWebhook`: WAHA REST client for sessions, chat send/receive, media, webhooks |
 | `logger.py` | [modules/LOGGER_README.md](modules/LOGGER_README.md) | Structured logger: SUCCESS level, JSON/text, rotating files, redaction, distributed tracing, context tags |
 | `EMXQ_MQTT.py` | [modules/EMQX_README.md](modules/EMQX_README.md) | EMQX v5 REST API client: users, clients, subscriptions, topics, messages, API keys, rules, bridges, listeners, nodes, auth |
 | `RabbitMQQueue_play.py` | [modules/RABBITMQ_README.md](modules/RABBITMQ_README.md) | RabbitMQ queue handler: produce/consume/batch, exchange binding, auto-reconnect, context manager |
@@ -191,6 +193,7 @@ All managed via `pyproject.toml` — install with `uv sync`.
 | `ipython` | >=9.15.0 | Interactive Python (dev use) |
 | `passlib` | >=1.7.4 | PBKDF2 hashing (legacy redis) |
 | `pika` | >=1.3.2 | RabbitMQ AMQP client |
+| `pydantic` | >=2.10.0 | WAHA client models (`wa_util.py`) |
 | `pymongo` | >=4.10.0 | MongoDB driver |
 | `python-dotenv` | >=1.0.1 | Environment variable loading |
 | `redis` | >=5.0.0 | Redis driver (sync + async) |
@@ -212,6 +215,7 @@ All managed via `pyproject.toml` — install with `uv sync`.
 | Benchmark I/O-bound concurrent code | `multiprocessing_and_multiprocessing/io_bound_comp.py` |
 | Download files with progress bars | `multiprocessing_and_multiprocessing/image_downloader.py` |
 | Manage EMQX MQTT broker (REST API) | `modules/EMXQ_MQTT.py` |
+| Send/receive WhatsApp via self-hosted WAHA | `modules/wa_util.py` |
 | Produce/consume RabbitMQ queues | `modules/RabbitMQQueue_play.py` |
 | CRUD on MongoDB (with bulk, TTL, indexes) | `modules/MongoDB/mongo_util.py` |
 | Flat Redis storage + caching (hash/string/cache) | `modules/Redis/redis_core_util.py` |
@@ -226,6 +230,7 @@ All managed via `pyproject.toml` — install with `uv sync`.
 ## Related Docs
 
 - [Multiprocessing & Threading Guide](multiprocessing_and_multiprocessing/README.md)
+- [WAHA / WhatsApp Module](modules/WAHA_README.md)
 - [Logger Module](modules/LOGGER_README.md)
 - [EMQX Client Module](modules/EMQX_README.md)
 - [RabbitMQ Queue Module](modules/RABBITMQ_README.md)

@@ -11,3 +11,9 @@ wheels/
 .idea
 .vscode
 .env
+.env.waha
+composefiles/sessions/
+waha/sessions/*
+!waha/sessions/.gitkeep
+waha/media/*
+!waha/media/.gitkeep

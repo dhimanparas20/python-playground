@@ -1,0 +1,28 @@
+services:
+  waha:
+    container_name: waha
+    restart: always
+    image: devlikeapro/waha
+
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '100m'
+        max-file: '10'
+
+    ports:
+      - '3001:3000/tcp'
+
+#    networks:
+#      - app-network
+
+    volumes:
+      # Host: repo/waha/sessions — comment if using MongoDB/Postgres session store
+      - '../waha/sessions:/app/.sessions'
+
+      # Host: repo/waha/media
+      # https://waha.devlike.pro/docs/how-to/storages/#save-media-files-between-the-container-restarts
+      - '../waha/media:/app/.media'
+
+    env_file:
+      - ../.env.waha
