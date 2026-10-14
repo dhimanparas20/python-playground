@@ -1,5 +1,4 @@
 import subprocess
-import os
 from pathlib import Path
 
 def generate_ssh_access(key_name: str, comment: str = "generated_key"):

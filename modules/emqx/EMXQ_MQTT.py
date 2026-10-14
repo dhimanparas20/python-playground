@@ -8,7 +8,6 @@ topics, messages, API keys, rules, data bridges, listeners, nodes, and health.
 from __future__ import annotations
 
 import json
-import logging
 import time
 from typing import Any, Dict, List, Optional, Union
 
@@ -18,7 +17,9 @@ try:
 except ImportError:
     raise ImportError("Install requests: pip install requests")
 
-logger = logging.getLogger(__name__)
+from modules.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class EMQXAPIError(Exception):

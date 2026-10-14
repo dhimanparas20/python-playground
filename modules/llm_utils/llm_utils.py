@@ -40,20 +40,52 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional, Sequence
 
-logger = logging.getLogger(__name__)
+def _load_dotenv_skip_empty(path: str | Path = ".env") -> None:
+    """
+    Load .env into os.environ without letting blank ``KEY=`` lines wipe values.
 
-try:
-    from dotenv import load_dotenv
+    python-dotenv's last-assignment-wins means a later empty ``AI_GATEWAY_API_KEY=``
+    can replace an earlier real key. We keep the last *non-empty* assignment per
+    key, and only fill env slots that are missing/blank (do not override a
+    non-empty process env).
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
 
-    load_dotenv()
-except ImportError:
-    pass
+    load_dotenv(dotenv_path=path)
+
+    env_path = Path(path)
+    if not env_path.is_file():
+        return
+
+    nonempty: dict[str, str] = {}
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip("'").strip('"')
+        if key and value:
+            nonempty[key] = value
+
+    for key, value in nonempty.items():
+        if not (os.getenv(key) or "").strip():
+            os.environ[key] = value
+
+
+_load_dotenv_skip_empty()
+
+from modules.logger import get_logger
+
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Tunables / defaults (edit these — or override via function args / .env)
@@ -69,10 +101,24 @@ DEFAULT_DEMO_QUERY: str = os.getenv(
     "Reply with exactly one short sentence confirming you work.",
 )
 
-# Optional manual USD pricing ($ per 1M tokens). Fill when you know the model rates.
+def _env_float(name: str) -> Optional[float]:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        return None
+
+
+# Optional manual USD pricing ($ per 1M tokens). From .env or set here.
 # Example: gpt-4o-ish → input 2.50, output 10.00
-DEFAULT_INPUT_PRICE_PER_MILLION: Optional[float] = None
-DEFAULT_OUTPUT_PRICE_PER_MILLION: Optional[float] = None
+DEFAULT_INPUT_PRICE_PER_MILLION: Optional[float] = _env_float(
+    "DEFAULT_INPUT_PRICE_PER_MILLION"
+)
+DEFAULT_OUTPUT_PRICE_PER_MILLION: Optional[float] = _env_float(
+    "DEFAULT_OUTPUT_PRICE_PER_MILLION"
+)
 
 # Attr name used to stash pricing on llm / agent objects
 _PRICING_ATTR = "_llm_utils_pricing"
@@ -600,11 +646,41 @@ def create_llm(
     **extra: Any,
 ):
     """
-    Factory to create a LangChain chat model instance.
+    Factory to create a LangChain chat model instance from ``MODEL_REGISTRY``.
 
-    input_price_per_million / output_price_per_million are optional manual
-    USD rates ($ per 1M tokens). Stashed on the model for later cost estimates;
-    not sent to the provider.
+    Resolves model name / API key from args or provider env vars, then
+    instantiates the provider class (e.g. ``ChatOpenAI``). Pricing args are
+    stashed on the model for later cost estimates and are not sent to the API.
+
+    Args:
+        model_name: Chat model id (e.g. ``"gpt-4o"``). When omitted, read from
+            the provider's ``model_env`` (e.g. ``OPENAI_MODEL``).
+        api_key: Provider API key. When omitted, read from the provider's
+            ``api_key_env`` / fallbacks (e.g. ``OPENAI_API_KEY``).
+        model_provider: Registry key: ``"openai"``, ``"google"``,
+            ``"openrouter"``, ``"groq"``, or ``"vercel_ai_gateway"``. Defaults
+            to ``DEFAULT_PROVIDER`` (from the ``DEFAULT_PROVIDER`` env).
+        model_temperature: Sampling temperature. When omitted, uses
+            ``MODEL_TEMPERATURE`` env (if set); otherwise provider default.
+        max_tokens: Max completion tokens. When omitted, uses ``MAX_TOKENS``
+            env (if set); otherwise provider default.
+        input_price_per_million: Optional USD cost per 1M input tokens. Stored
+            on the model for ``estimate_cost`` / ``print_run_summary``; not
+            forwarded to the provider.
+        output_price_per_million: Optional USD cost per 1M output tokens.
+            Same stash behavior as ``input_price_per_million``.
+        **extra: Extra kwargs passed through to the chat model constructor
+            (e.g. ``timeout``, ``max_retries``, provider-specific options).
+            Do not pass ``model`` / ``api_key`` / ``temperature`` /
+            ``max_tokens`` / ``base_url`` here — those are set by this factory.
+
+    Returns:
+        A LangChain chat model instance for the chosen provider.
+
+    Raises:
+        ValueError: Unknown ``model_provider``, or missing model name / API key
+            after env resolution.
+        ImportError: Provider package / class cannot be imported.
     """
     model_provider = _clean_str(model_provider) or DEFAULT_PROVIDER  # type: ignore[assignment]
     model_name = _clean_str(model_name)
@@ -692,18 +768,76 @@ def get_agent(
     output_price_per_million: Optional[float] = None,
 ):
     """
-    Build a LangChain agent via create_llm + langchain.agents.create_agent.
+    Build a LangChain agent via ``create_llm`` + ``langchain.agents.create_agent``.
 
-    If ``llm`` is passed, that model is used as-is (skip create_llm).
-    Otherwise create_llm is called with the model_* / pricing / llm_extra args.
+    If ``llm`` is passed, that model is used as-is (skip ``create_llm``).
+    Otherwise ``create_llm`` is called with the model / pricing / ``llm_extra``
+    args. Pricing is stashed on the agent for ``print_run_summary`` /
+    ``extract_usage``. When ``llm`` is provided and pricing args are omitted,
+    any pricing already stashed on that llm is reused.
 
-    Pass any tools from collect_tools / @tool / toolkits / MCP.
-    system_prompt accepts str or SystemMessage.
+    Args:
+        model_name: Chat model id when building via ``create_llm``. Ignored if
+            ``llm`` is provided. Falls back to the provider ``model_env``.
+        api_key: Provider API key when building via ``create_llm``. Ignored if
+            ``llm`` is provided. Falls back to the provider ``api_key_env``.
+        model_provider: Registry key for ``create_llm`` (``"openai"``,
+            ``"google"``, ``"openrouter"``, ``"groq"``,
+            ``"vercel_ai_gateway"``). Ignored if ``llm`` is provided. Defaults
+            to ``DEFAULT_PROVIDER``.
+        model_temperature: Sampling temperature for ``create_llm``. Ignored if
+            ``llm`` is provided.
+        llm: Pre-built LangChain chat model. When set, skips ``create_llm`` and
+            uses this instance as the agent model.
+        tools: Tools for the agent — ``@tool`` callables, ``BaseTool``
+            instances, dicts, or the list from ``collect_tools``. ``None`` /
+            empty means a model-only agent (no tool loop).
+        system_prompt: System instructions as ``str`` or ``SystemMessage``.
+            Defaults to ``DEFAULT_SYSTEM_PROMPT``. Added at the start of the
+            message list when calling the model.
+        response_format: Structured-output config (e.g. Pydantic model,
+            ``ToolStrategy``, ``ProviderStrategy``, or raw schema). When set,
+            the agent produces structured responses.
+        middleware: Sequence of LangChain agent middleware instances that
+            intercept / modify behavior at various stages.
+        state_schema: Optional ``TypedDict`` extending ``AgentState``. Used as
+            the base state schema (merged with middleware state) so you can
+            add custom fields.
+        context_schema: Optional schema type for immutable run-scoped context
+            (passed via invoke ``context``), separate from mutable agent state.
+        checkpointer: LangGraph checkpointer (e.g. ``InMemorySaver``) for
+            short-term / thread memory across turns. Use with
+            ``config={"configurable": {"thread_id": "..."}}``.
+        store: Optional LangGraph ``BaseStore`` for longer-term cross-thread
+            memory.
+        interrupt_before: Node names to interrupt before (human-in-the-loop).
+            Common values include ``"tools"``.
+        interrupt_after: Node names to interrupt after (human-in-the-loop).
+        debug: Enable verbose LangGraph execution logging (node runs, state
+            updates, transitions).
+        name: Optional name for the compiled graph (useful when nesting as a
+            subgraph in multi-agent setups).
+        cache: Optional LangGraph ``BaseCache`` for caching graph execution.
+        transformers: Optional sequence of stream-transformer factories
+            registered on the compiled graph (in addition to agent defaults /
+            middleware transformers).
+        max_tokens: Max completion tokens for ``create_llm``. Ignored if
+            ``llm`` is provided.
+        llm_extra: Extra kwargs forwarded to ``create_llm`` (``**extra``) when
+            building the model. Ignored if ``llm`` is provided.
+        input_price_per_million: Optional USD cost per 1M input tokens. Stashed
+            on the agent (and on a newly built llm). Overrides / refreshes
+            pricing already on a passed-in ``llm`` when set.
+        output_price_per_million: Optional USD cost per 1M output tokens. Same
+            stash behavior as ``input_price_per_million``.
 
-    Optional input_price_per_million / output_price_per_million ($ per 1M
-    tokens) are stashed on the agent for print_run_summary / extract_usage.
-    When ``llm`` is provided and pricing args are omitted, any pricing
-    already stashed on that llm is reused.
+    Returns:
+        A compiled LangGraph ``CompiledStateGraph`` agent (invoke / stream).
+
+    Raises:
+        ImportError: ``langchain`` is not installed, or provider package
+            missing when ``create_llm`` runs.
+        ValueError: Invalid / incomplete model config from ``create_llm``.
     """
     try:
         from langchain.agents import create_agent
@@ -766,6 +900,20 @@ def run_invoke(agent: Any, text: str, *, config: Optional[dict] = None) -> dict[
     return agent.invoke(agent_input(text), config=config)
 
 
+def _is_model_text_chunk(token: Any, meta: Any) -> bool:
+    """True only for assistant text tokens (skip tool node / ToolMessage)."""
+    if isinstance(meta, dict):
+        node = str(meta.get("langgraph_node") or "")
+        if node == "tools" or node.startswith("tools"):
+            return False
+
+    name = token.__class__.__name__
+    msg_type = getattr(token, "type", None)
+    if msg_type == "tool" or "ToolMessage" in name:
+        return False
+    return msg_type == "ai" or "AIMessage" in name
+
+
 def run_stream(
     agent: Any,
     text: str,
@@ -774,11 +922,14 @@ def run_stream(
     print_tokens: bool = True,
 ) -> dict[str, Any]:
     """
-    Stream agent with messages+updates, print tokens live, return final state.
+    Stream agent with messages+updates, print model tokens live, return final state.
 
-    Usage usually appears on completed AI messages in updates (not every token).
+    Only streams assistant text to the console — tool call args / tool results
+    are never printed. Messages from every update step are still accumulated
+    for ``extract_usage`` / ``print_run_summary``.
     """
-    final: dict[str, Any] = {"messages": []}
+    messages: list[Any] = []
+    final: dict[str, Any] = {"messages": messages}
     stream_kwargs: dict[str, Any] = {
         "stream_mode": ["messages", "updates"],
         "version": "v2",
@@ -786,27 +937,36 @@ def run_stream(
     if config is not None:
         stream_kwargs["config"] = config
 
-    print("\n=== stream (tokens) ===")
+    if print_tokens:
+        print()
     for chunk in agent.stream(agent_input(text), **stream_kwargs):
         if isinstance(chunk, dict) and "type" in chunk:
             kind = chunk.get("type")
             data = chunk.get("data")
             if kind == "messages" and data:
-                token, _meta = data
+                token, meta = data
+                if not print_tokens or not _is_model_text_chunk(token, meta):
+                    continue
                 piece = getattr(token, "content", None) or ""
-                if piece and print_tokens:
+                if isinstance(piece, list):
+                    # content blocks — only join text parts
+                    piece = "".join(
+                        str(b.get("text", "")) if isinstance(b, dict) else str(b)
+                        for b in piece
+                        if not (isinstance(b, dict) and b.get("type") == "tool_use")
+                    )
+                if piece:
                     print(piece, end="", flush=True)
             elif kind == "updates" and isinstance(data, dict):
                 for _node, update in data.items():
                     if isinstance(update, dict) and "messages" in update:
-                        final = update
-        else:
-            print(chunk)
+                        step_msgs = update.get("messages") or []
+                        messages.extend(step_msgs)
+                        final = {**update, "messages": messages}
 
     if print_tokens:
         print()
-    return final if final.get("messages") else final
-
+    return final
 
 # ---------------------------------------------------------------------------
 # Demo

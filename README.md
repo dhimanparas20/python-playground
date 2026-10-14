@@ -48,36 +48,40 @@ In [16]: from modules.s3.s3_util import S3Util
 In [17]: s3 = S3Util()
 In [18]: s3.list_files("my-bucket")
 
-In [19]: from modules.EMXQ_MQTT import EMQXClient
-In [20]: client = EMQXClient()
-In [21]: client.get_status()
+In [19]: from modules.qdrant import QdrantUtil, get_embeddings
+In [20]: qd = QdrantUtil()                       # or embeddings=get_embeddings("openai")
+In [21]: qd.list_collections()
 
-In [22]: from modules.RabbitMQQueue_play import RabbitMQQueue
-In [23]: q = RabbitMQQueue("my_queue")
-In [24]: q.produce({"key": "value"})
+In [22]: from modules.emqx import EMQXClient
+In [23]: client = EMQXClient()
+In [24]: client.get_status()
 
-In [25]: from modules.function_timer_decorator import timeit
-In [26]: @timeit
+In [25]: from modules.rabbitmq import RabbitMQQueue
+In [26]: q = RabbitMQQueue("my_queue")
+In [27]: q.produce({"key": "value"})
+
+In [28]: from modules.function_timer import timeit
+In [29]: @timeit
     ...: def slow_add(a, b):
     ...:     import time; time.sleep(1)
     ...:     return a + b
-In [27]: slow_add(1, 2)
+In [30]: slow_add(1, 2)
 
-In [28]: from encrypt_and_decrypt_data import hash_password, validate_password
-In [29]: h = hash_password("mysecret123")
-In [30]: validate_password("mysecret123", h)
+In [31]: from encrypt_and_decrypt_data import hash_password, validate_password
+In [32]: h = hash_password("mysecret123")
+In [33]: validate_password("mysecret123", h)
 
-In [31]: from faker_fake_data import make_fake_people
-In [32]: df = make_fake_people(5)    # returns DataFrame
+In [34]: from faker_fake_data import make_fake_people
+In [35]: df = make_fake_people(5)    # returns DataFrame
 
-In [33]: import multiprocessing_and_multiprocessing.learn_threding as lt
-In [34]: lt.main()                   # run threading demo
+In [36]: import multiprocessing_and_multiprocessing.learn_threding as lt
+In [37]: lt.main()                   # run threading demo
 
-In [35]: import multiprocessing_and_multiprocessing.cpu_bound_comp as cpu
-In [36]: cpu.main()                  # run CPU-bound comparison
+In [38]: import multiprocessing_and_multiprocessing.cpu_bound_comp as cpu
+In [39]: cpu.main()                  # run CPU-bound comparison
 
-In [37]: from code_practice.map_func import process_students
-In [38]: process_students()          # run map/filter/lambda demo
+In [40]: from code_practice.map_func import process_students
+In [41]: process_students()          # run map/filter/lambda demo
 ```
 
 Tab-completion and `?` work too — e.g. `MongoUtil?` shows full docstring.
@@ -119,7 +123,8 @@ python-playground/
     ├── datetime_parser/                   # Datetime parsing with 100+ timezone aliases
     ├── MongoDB/                           # MongoDB CRUD utility
     ├── Redis/                             # Redis hash & cache utility suite
-    └── s3/                                # AWS S3 utility
+    ├── s3/                                # AWS S3 utility
+    └── qdrant/                            # Qdrant vector DB utility
 ```
 
 ---
@@ -174,6 +179,7 @@ Each module has its own comprehensive README with full API docs.
 | `MongoDB/mongo_util.py` | [modules/MongoDB/MONGO_UTIL_README.md](modules/MongoDB/MONGO_UTIL_README.md) | Full MongoDB utility: CRUD, bulk ops, TTL, indexes, search, JSON/CSV import/export, dedup, secure hashing, admin operations |
 | `Redis/` | [modules/Redis/REDIS_UTIL_README.md](modules/Redis/REDIS_UTIL_README.md) | `RedisHashUtil` (hash storage, CRUD, bulk, TTL, locks, indexes, async) + `RedisStringUtil` (string KV store, memoize, async) + `RedisCache` (cache layer on string util, cache-aside, TTL, async) |
 | `s3/` | [modules/s3/S3_UTIL_README.md](modules/s3/S3_UTIL_README.md) | `S3Util`: upload, download, delete, list, fetch, metadata, existence checks. Backward-compatible wrappers for all operations |
+| `qdrant/` | [modules/qdrant/QDRANT_UTIL_README.md](modules/qdrant/QDRANT_UTIL_README.md) | `QdrantUtil` (collections/search/upsert) + `DocumentUtil` (load/split/embed PDF, MD, HTML, CSV, TXT, URL, dirs) |
 
 ---
 
@@ -196,6 +202,7 @@ All managed via `pyproject.toml` — install with `uv sync`.
 | `pydantic` | >=2.10.0 | WAHA client models (`wa_util.py`) |
 | `pymongo` | >=4.10.0 | MongoDB driver |
 | `python-dotenv` | >=1.0.1 | Environment variable loading |
+| `qdrant-client` | >=1.19.1 | Qdrant vector DB client |
 | `redis` | >=5.0.0 | Redis driver (sync + async) |
 | `requests` | >=2.32.0 | HTTP client (EMQX, image downloader) |
 | `tqdm` | >=4.66.2 | Progress bars (image downloader) |
@@ -220,6 +227,7 @@ All managed via `pyproject.toml` — install with `uv sync`.
 | CRUD on MongoDB (with bulk, TTL, indexes) | `modules/MongoDB/mongo_util.py` |
 | Flat Redis storage + caching (hash/string/cache) | `modules/Redis/redis_core_util.py` |
 | Upload/download files to S3 | `modules/s3/s3_util.py` |
+| Vector search / Qdrant CRUD | `modules/qdrant/qdrant_util.py` |
 | Structured JSON logging with tracing | `modules/logger.py` |
 | Parse/convert datetimes across 100+ timezones | `modules/datetime_parser/` |
 | Time function execution with decorators | `modules/function_timer_decorator.py` |
@@ -238,3 +246,4 @@ All managed via `pyproject.toml` — install with `uv sync`.
 - [MongoDB Utility Module](modules/MongoDB/MONGO_UTIL_README.md)
 - [Redis Utility Module](modules/Redis/REDIS_UTIL_README.md)
 - [S3 Utility Module](modules/s3/S3_UTIL_README.md)
+- [Qdrant Utility Module](modules/qdrant/QDRANT_UTIL_README.md)

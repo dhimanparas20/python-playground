@@ -51,16 +51,17 @@ from tenacity import (
     after_log,
 )
 
+from modules.logger import get_logger
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 # Suppress noisy low-level debug logs from httpx/httpcore.
-# Only our module's logs will be visible at INFO+ by default.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Retry policy

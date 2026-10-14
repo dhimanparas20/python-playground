@@ -140,6 +140,8 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
+from modules.logger import get_logger
+
 __all__ = [
     "HttpClient",
     "RequestError",
@@ -169,11 +171,7 @@ __version__: Final[str] = "2.0.0"
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-# A library must never configure logging or mutate other loggers' levels.
-# We attach a NullHandler so that "No handlers could be found" warnings are
-# suppressed when the consuming application has not configured logging.
-logger: Final[logging.Logger] = logging.getLogger(__name__)
-logger.addHandler(logging.NullHandler())
+logger: Final[logging.Logger] = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Type aliases

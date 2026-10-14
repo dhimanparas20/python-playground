@@ -8,8 +8,6 @@ queue management, exchange binding, auto-reconnection, and context manager.
 from __future__ import annotations
 
 import json
-import logging
-import threading
 from time import sleep
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -20,7 +18,9 @@ try:
 except ImportError:
     raise ImportError("Install pika: pip install pika")
 
-logger = logging.getLogger(__name__)
+from modules.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class RabbitMQQueue:

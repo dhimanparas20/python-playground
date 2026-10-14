@@ -22,13 +22,14 @@ Date: 2026-06-23
 
 from __future__ import annotations
 
-import logging
 import sys
 from datetime import datetime
 from typing import Any, Optional
 
 from dateparser import parse as dateparser_parse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from modules.logger import get_logger
 
 # ======================================================================
 # Module-level configuration
@@ -37,7 +38,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 __version__ = "3.0.0"
 __author__ = "T3 Chat"
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Default timezone used when input datetime is naive (no timezone info)
 DEFAULT_TIMEZONE: str = "Asia/Kolkata"

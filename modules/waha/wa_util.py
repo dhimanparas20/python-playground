@@ -10,7 +10,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import logging
 import mimetypes
 import os
 import secrets
@@ -30,7 +29,9 @@ try:
 except ImportError:
     raise ImportError("Install pydantic: pip install pydantic")
 
-logger = logging.getLogger(__name__)
+from modules.logger import get_logger
+
+logger = get_logger(__name__)
 
 # Media argument for send_image / send_file / etc. (see _resolve_file).
 FileInput = Union[str, Path, Dict[str, Any]]
