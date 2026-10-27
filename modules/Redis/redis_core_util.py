@@ -13,9 +13,9 @@ from __future__ import annotations
 import csv
 import functools
 import hashlib
+import hmac
 import io
 import json
-import random
 import secrets
 import string
 import time
@@ -40,6 +40,7 @@ except ImportError:
 T = TypeVar("T")
 
 _REDIS_URL_SCHEMES: tuple = ("redis", "rediss", "unix")
+HAS_NATIVE_UUID7 = hasattr(uuid, "uuid7")
 
 
 def validate_redis_connection(url: str, timeout: float = 5.0) -> None:
@@ -1313,10 +1314,6 @@ class RedisHashUtil:
 
         Returns:
             Random string of specified length.
-
-        Example:
-            >>> RedisHashUtil.generate_random_string(16)
-            'aB3kQ9mN2xR7pL4w'
         """
         return "".join(secrets.choice(charset) for _ in range(length))
 
@@ -1324,35 +1321,71 @@ class RedisHashUtil:
     def generate_random_number(length: int = 6) -> str:
         """
         Generate a cryptographically secure random numeric string.
-        Useful for OTPs, PINs, and verification codes.
+        Useful for OTPs, PINs, and verification codes. Alias for generate_secure_otp.
 
         Args:
             length: Number of digits. Defaults to 6.
 
         Returns:
             Random numeric string of specified length.
-
-        Example:
-            >>> RedisHashUtil.generate_random_number(6)
-            '482917'
-            >>> RedisHashUtil.generate_random_number(4)
-            '0372'
         """
+        # Minimum safety threshold for standard numeric identifiers
+        if length < 4 or length > 12:
+            raise ValueError("OTP/PIN length must be between 4 and 12 digits for production security.")
+
         digits = string.digits
         return "".join(secrets.choice(digits) for _ in range(length))
 
     @staticmethod
-    def generate_token(length: int = 64) -> str:
+    def generate_token(total_character_length: int = 64) -> str:
         """
-        Generate a cryptographically secure URL-safe token.
+        Generate a cryptographically secure URL-safe token of an exact character length.
 
         Args:
-            length: Byte length before encoding. Defaults to 64.
+            total_character_length: Exact character length of the output string. Defaults to 64.
 
         Returns:
-            URL-safe token string.
+            URL-safe token string matching the exact length requested.
         """
-        return secrets.token_urlsafe(length)
+        # For standard non-prefixed tokens, ensure we keep a strong entropy floor
+        import math
+        if total_character_length < 32:
+            raise ValueError("Token length must be at least 32 characters to maintain enterprise-grade security.")
+
+        estimated_bytes = math.ceil(total_character_length * 3 / 4)
+        return secrets.token_urlsafe(estimated_bytes + 2)[:total_character_length]
+
+    @staticmethod
+    def generate_custom_secret(prefix: str, total_length: int = 48, delimiter: str = "_") -> str:
+        """
+        Generates a cryptographically secure, prefixed API key of an exact total character length
+        using the native secrets.token_urlsafe() function.
+
+        Args:
+            prefix: The hardcoded identifier string (e.g., 'sk', 'acme').
+            total_length: The precise total character length of the finished key. Defaults to 48.
+            delimiter: The separator between the prefix and the secret string. Defaults to "_".
+
+        Returns:
+            A securely generated, prefixed token string matching the total_length.
+        """
+        import math
+        prefix_part = f"{prefix}{delimiter}"
+        needed_secret_length = total_length - len(prefix_part)
+
+        # Hard production safety check
+        if needed_secret_length < 32:
+            raise ValueError(
+                f"Total length ({total_length}) is too short. After accounting for the "
+                f"prefix '{prefix_part}', the remaining secret portion must be at least "
+                f"32 characters long to maintain enterprise-grade security."
+            )
+
+        # Calculate bytes needed to yield at least that many characters in Base64
+        estimated_bytes = math.ceil(needed_secret_length * 3 / 4)
+        random_secret = secrets.token_urlsafe(estimated_bytes + 2)[:needed_secret_length]
+
+        return f"{prefix_part}{random_secret}"
 
     @staticmethod
     def generate_uuid4() -> str:
@@ -1373,6 +1406,35 @@ class RedisHashUtil:
         """
         ns_uuid = uuid.uuid5(uuid.NAMESPACE_DNS, namespace)
         return str(uuid.uuid5(ns_uuid, name))
+
+    @staticmethod
+    def generate_uuid7() -> str:
+        """
+        Generate a cryptographically secure, time-ordered UUIDv7.
+        Highly performant for database primary indexing and ordered keys.
+        """
+        if HAS_NATIVE_UUID7:
+            return str(uuid.uuid7())  # Handles native 3.14+ generation efficiently
+
+        # Pure Python fallback that accurately mimics the RFC 9562 structural specification
+        # 1. Capture current Unix epoch timestamp in milliseconds (48-bit value)
+        unix_ts_ms = int(time.time() * 1000)
+
+        # 2. Extract structured 10 bytes (80 bits) of system entropy
+        rand_bytes = bytearray(secrets.token_bytes(10))
+
+        # 3. Inject Version 7 structure into the top 4 bits of UUID Byte 6 (rand_bytes[0])
+        rand_bytes[0] = (rand_bytes[0] & 0x0F) | 0x70
+
+        # 4. Inject RFC Variant 1 layout (0x80) into top 2 bits of UUID Byte 8 (rand_bytes[2])
+        rand_bytes[2] = (rand_bytes[2] & 0x3F) | 0x80
+
+        # 5. Piece bits together sequentially
+        uuid_bytes = (
+                unix_ts_ms.to_bytes(6, byteorder='big') +
+                rand_bytes
+        )
+        return str(uuid.UUID(bytes=uuid_bytes))
 
     @staticmethod
     def hash_password(password: str) -> str:
@@ -1407,45 +1469,30 @@ class RedisHashUtil:
         """
         Hash sensitive data (emails, PII) using SHA-256.
         One-way hash for data that doesn't need to be reversed.
-
-        Args:
-            data: Sensitive data to hash.
-            pepper: Optional application-level pepper for added security.
-
-        Returns:
-            Hex digest of hashed data.
         """
-        salted = f"{pepper}{data}".encode("utf-8")
+        # Append pepper to the end rather than prepending to mitigate structural hashing flaws
+        salted = f"{data}{pepper}".encode("utf-8")
         return hashlib.sha256(salted).hexdigest()
 
     @staticmethod
     def hash_sensitive_data_hmac(data: str, secret: str) -> str:
         """
-        Hash sensitive data using HMAC-SHA256.
-
-        Args:
-            data: Sensitive data to hash.
-            secret: Secret key for HMAC.
-
-        Returns:
-            Hex digest of HMAC hash.
+        Hash sensitive data securely using actual cryptographic HMAC-SHA256.
         """
-        return hashlib.new("sha256", f"{secret}{data}".encode("utf-8"), usedforsecurity=True).hexdigest()
+        key_bytes = secret.encode("utf-8")
+        data_bytes = data.encode("utf-8")
+        # FIX: Uses the native hmac module to securely handle key padding and processing
+        return hmac.new(key_bytes, data_bytes, digestmod=hashlib.sha256).hexdigest()
 
     @staticmethod
     def generate_hash_id(data: Dict[str, Any]) -> str:
         """
-        Generate a deterministic hash ID from a data dictionary.
-        Useful for deduplication.
-
-        Args:
-            data: Dictionary to hash.
-
-        Returns:
-            16-character hash ID.
+        Generate a deterministic hash ID from a data dictionary safely.
+        Handles nested items and maintains exact formatting for stable deduplication.
         """
-        canonical = str(sorted(data.items()))
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+        # FIX: standardizes JSON formatting, sorts keys, and safely processes complex datasets
+        canonical_json = json.dumps(data, sort_keys=True, default=str)
+        return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()[:16]
 
     def __repr__(self) -> str:
         """String representation of RedisHashUtil."""
