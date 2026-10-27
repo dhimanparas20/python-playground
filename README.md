@@ -180,6 +180,7 @@ Each module has its own comprehensive README with full API docs.
 | `Redis/` | [modules/Redis/REDIS_UTIL_README.md](modules/Redis/REDIS_UTIL_README.md) | `RedisHashUtil` (hash storage, CRUD, bulk, TTL, locks, indexes, async) + `RedisStringUtil` (string KV store, memoize, async) + `RedisCache` (cache layer on string util, cache-aside, TTL, async) |
 | `s3/` | [modules/s3/S3_UTIL_README.md](modules/s3/S3_UTIL_README.md) | `S3Util`: upload, download, delete, list, fetch, metadata, existence checks. Backward-compatible wrappers for all operations |
 | `qdrant/` | [modules/qdrant/QDRANT_UTIL_README.md](modules/qdrant/QDRANT_UTIL_README.md) | `QdrantUtil` (collections/search/upsert) + `DocumentUtil` (load/split/embed PDF, MD, HTML, CSV, TXT, URL, dirs) |
+| `llm_utils/` | [modules/llm_utils/LLM-UTIL-README.md](modules/llm_utils/LLM-UTIL-README.md) | LangChain chat models + agents across OpenAI, Google, OpenRouter, Groq, Vercel AI Gateway, OpenCode (Zen + Go); `register_provider` for any other OpenAI-compatible provider; MCP / file tools; token + cost summaries |
 
 ---
 
@@ -247,3 +248,4 @@ All managed via `pyproject.toml` — install with `uv sync`.
 - [Redis Utility Module](modules/Redis/REDIS_UTIL_README.md)
 - [S3 Utility Module](modules/s3/S3_UTIL_README.md)
 - [Qdrant Utility Module](modules/qdrant/QDRANT_UTIL_README.md)
+- [LLM Utility Module](modules/llm_utils/LLM-UTIL-README.md)

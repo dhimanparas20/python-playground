@@ -76,7 +76,7 @@ def retrieve_from_book(query: str, top_k: int = TOP_K) -> str:
 def build_agent():
     tools = collect_tools(extra=[retrieve_from_book], mcp=False)
     llm = create_llm(
-        model_provider=DEFAULT_PROVIDER,
+        provider=DEFAULT_PROVIDER,
         input_price_per_million=DEFAULT_INPUT_PRICE_PER_MILLION,
         output_price_per_million=DEFAULT_OUTPUT_PRICE_PER_MILLION,
     )
